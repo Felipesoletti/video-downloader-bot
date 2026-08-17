@@ -1,15 +1,10 @@
 import os
 import re
 import html
-import time
-import sqlite3
-import tempfile
-import threading
 import requests
 import yt_dlp
 
 from flask import Flask, request, jsonify
-from concurrent.futures import ThreadPoolExecutor
 
 
 # =========================================================
@@ -23,152 +18,11 @@ app = Flask(__name__)
 # CONFIGURAÇÕES
 # =========================================================
 
-TELEGRAM_TOKEN = os.environ.get(
-    "TELEGRAM_TOKEN",
-    ""
-)
-
 API_SECRET = os.environ.get(
     "API_SECRET",
     ""
 )
 
-MAX_WORKERS = int(
-    os.environ.get(
-        "MAX_WORKERS",
-        "3"
-    )
-)
-
-MAX_TELEGRAM_FILE_SIZE = (
-    49 * 1024 * 1024
-)
-
-
-# =========================================================
-# FILA
-# =========================================================
-
-executor = ThreadPoolExecutor(
-    max_workers=MAX_WORKERS
-)
-
-
-# =========================================================
-# BANCO LOCAL DE JOBS
-#
-# Evita que o mesmo job seja executado várias vezes.
-# =========================================================
-
-DB_PATH = "/tmp/video_jobs.sqlite3"
-
-db_lock = threading.Lock()
-
-
-def init_database():
-
-    with sqlite3.connect(DB_PATH) as conn:
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS jobs (
-                job_id TEXT PRIMARY KEY,
-                created_at REAL NOT NULL,
-                status TEXT NOT NULL
-            )
-            """
-        )
-
-        conn.commit()
-
-
-init_database()
-
-
-def register_job(job_id):
-
-    if not job_id:
-        return True
-
-    with db_lock:
-
-        try:
-
-            with sqlite3.connect(
-                DB_PATH
-            ) as conn:
-
-                conn.execute(
-                    """
-                    INSERT INTO jobs (
-                        job_id,
-                        created_at,
-                        status
-                    )
-                    VALUES (?, ?, ?)
-                    """,
-                    (
-                        job_id,
-                        time.time(),
-                        "queued"
-                    )
-                )
-
-                conn.commit()
-
-                return True
-
-        except sqlite3.IntegrityError:
-
-            print(
-                "JOB DUPLICADO IGNORADO:",
-                job_id
-            )
-
-            return False
-
-
-def update_job_status(
-    job_id,
-    status
-):
-
-    if not job_id:
-        return
-
-    with db_lock:
-
-        try:
-
-            with sqlite3.connect(
-                DB_PATH
-            ) as conn:
-
-                conn.execute(
-                    """
-                    UPDATE jobs
-                    SET status = ?
-                    WHERE job_id = ?
-                    """,
-                    (
-                        status,
-                        job_id
-                    )
-                )
-
-                conn.commit()
-
-        except Exception as error:
-
-            print(
-                "ERRO STATUS JOB:",
-                error
-            )
-
-
-# =========================================================
-# HEADERS
-# =========================================================
 
 HEADERS = {
     "User-Agent": (
@@ -190,7 +44,7 @@ HEADERS = {
         "application/xml;q=0.9,"
         "image/avif,image/webp,"
         "*/*;q=0.8"
-    ),
+    )
 }
 
 
@@ -204,11 +58,14 @@ def home():
     return jsonify({
         "status": "ok",
         "service": "video-downloader-bot",
-        "mode": "async",
-        "workers": MAX_WORKERS,
-        "telegram_video": True
+        "version": "3.0",
+        "mode": "extract-only"
     })
 
+
+# =========================================================
+# HEALTH
+# =========================================================
 
 @app.get("/health")
 def health():
@@ -250,6 +107,10 @@ def is_shopee(url):
     )
 
 
+# =========================================================
+# RESOLVE LINK CURTO
+# =========================================================
+
 def resolve_url(url):
 
     response = requests.get(
@@ -263,6 +124,10 @@ def resolve_url(url):
 
     return response.url
 
+
+# =========================================================
+# LIMPA URL
+# =========================================================
 
 def clean_media_url(value):
 
@@ -288,11 +153,243 @@ def clean_media_url(value):
         "&"
     )
 
+    value = value.replace(
+        "&amp;",
+        "&"
+    )
+
     if value.startswith("//"):
         value = "https:" + value
 
     return value
 
+
+# =========================================================
+# REMOVE DUPLICADOS
+# =========================================================
+
+def unique_urls(urls):
+
+    result = []
+
+    seen = set()
+
+    for url in urls:
+
+        if not url:
+            continue
+
+        url = clean_media_url(
+            url
+        )
+
+        if not url:
+            continue
+
+        if url in seen:
+            continue
+
+        seen.add(
+            url
+        )
+
+        result.append(
+            url
+        )
+
+    return result
+
+
+# =========================================================
+# DETECTA POSSÍVEL WATERMARK PELA URL
+#
+# Isso NÃO remove watermark.
+# Só reduz prioridade de variantes identificadas
+# explicitamente como watermark/logo/overlay.
+# =========================================================
+
+def has_watermark_hint(url):
+
+    lower = str(url).lower()
+
+    patterns = [
+        "watermark",
+        "overlay",
+        "with_logo",
+        "with-logo",
+        "watermarked",
+        "?wm=",
+        "&wm=",
+        "?watermark=",
+        "&watermark=",
+    ]
+
+    return any(
+        item in lower
+        for item in patterns
+    )
+
+
+# =========================================================
+# AVALIA UM CANDIDATO SHOPEE
+# =========================================================
+
+def probe_candidate(
+    media_url,
+    referer
+):
+
+    result = {
+        "url": media_url,
+        "valid": False,
+        "size": 0,
+        "content_type": "",
+        "score": 0,
+        "watermark_hint": False
+    }
+
+
+    try:
+
+        response = requests.get(
+            media_url,
+
+            headers={
+                **HEADERS,
+                "Referer": referer
+            },
+
+            stream=True,
+
+            allow_redirects=True,
+
+            timeout=15
+        )
+
+
+        result[
+            "content_type"
+        ] = (
+            response.headers
+            .get(
+                "content-type",
+                ""
+            )
+            .lower()
+        )
+
+
+        content_length = (
+            response.headers
+            .get(
+                "content-length"
+            )
+        )
+
+
+        if content_length:
+
+            try:
+
+                result["size"] = int(
+                    content_length
+                )
+
+            except Exception:
+                pass
+
+
+        result[
+            "watermark_hint"
+        ] = has_watermark_hint(
+            media_url
+        )
+
+
+        if (
+            response.status_code < 400
+            and (
+                "video" in result[
+                    "content_type"
+                ]
+                or ".mp4" in media_url.lower()
+            )
+        ):
+
+            result[
+                "valid"
+            ] = True
+
+
+        response.close()
+
+
+    except Exception as error:
+
+        print(
+            "ERRO PROBE:",
+            media_url,
+            error
+        )
+
+        return result
+
+
+    # -----------------------------------------------------
+    # SCORE
+    #
+    # Maior arquivo tende a ser maior qualidade.
+    # -----------------------------------------------------
+
+    score = result[
+        "size"
+    ]
+
+
+    # CDN oficial de vídeo da Shopee ganha prioridade.
+
+    if (
+        "vod.susercontent.com"
+        in media_url.lower()
+    ):
+
+        score += (
+            500 * 1024 * 1024
+        )
+
+
+    # MP4 ganha prioridade.
+
+    if ".mp4" in media_url.lower():
+
+        score += (
+            100 * 1024 * 1024
+        )
+
+
+    # URLs explicitamente indicando watermark
+    # perdem bastante prioridade.
+
+    if result[
+        "watermark_hint"
+    ]:
+
+        score -= (
+            1000 * 1024 * 1024
+        )
+
+
+    result[
+        "score"
+    ] = score
+
+
+    return result
+
+
+# =========================================================
+# EXTRATOR SHOPEE
+# =========================================================
 
 def extract_shopee_video(url):
 
@@ -300,26 +397,33 @@ def extract_shopee_video(url):
         url
     )
 
+
     response = requests.get(
         final_url,
         headers=HEADERS,
         timeout=30
     )
 
+
     response.raise_for_status()
 
+
     page = response.text
+
 
     candidates = []
 
 
-    # -----------------------------------------------------
+    # =====================================================
     # MP4 DIRETO
-    # -----------------------------------------------------
+    # =====================================================
 
     patterns = [
+
         r'https?://[^"\']+\.mp4[^"\']*',
+
         r'https?:\\?/\\?/[^"\']+\.mp4[^"\']*',
+
     ]
 
 
@@ -331,33 +435,30 @@ def extract_shopee_video(url):
             flags=re.IGNORECASE
         )
 
-        for item in matches:
-
-            media_url = clean_media_url(
-                item
-            )
-
-            if (
-                media_url
-                and media_url not in candidates
-            ):
-
-                candidates.append(
-                    media_url
-                )
+        candidates.extend(
+            matches
+        )
 
 
-    # -----------------------------------------------------
+    # =====================================================
     # CAMPOS JSON
-    # -----------------------------------------------------
+    # =====================================================
 
     json_patterns = [
+
         r'"videoUrl"\s*:\s*"([^"]+)"',
+
         r'"video_url"\s*:\s*"([^"]+)"',
+
         r'"playUrl"\s*:\s*"([^"]+)"',
+
         r'"play_url"\s*:\s*"([^"]+)"',
-        r'"url"\s*:\s*"(https?:[^"]+\.mp4[^"]*)"',
+
+        r'"video"\s*:\s*"([^"]+\.mp4[^"]*)"',
+
         r'"src"\s*:\s*"(https?:[^"]+\.mp4[^"]*)"',
+
+        r'"url"\s*:\s*"(https?:[^"]+\.mp4[^"]*)"',
     ]
 
 
@@ -369,176 +470,216 @@ def extract_shopee_video(url):
             flags=re.IGNORECASE
         )
 
-        for item in matches:
-
-            media_url = clean_media_url(
-                item
-            )
-
-            if (
-                media_url
-                and media_url not in candidates
-            ):
-
-                candidates.append(
-                    media_url
-                )
+        candidates.extend(
+            matches
+        )
 
 
-    # -----------------------------------------------------
-    # VIDEO SRC
-    # -----------------------------------------------------
+    # =====================================================
+    # TAG <VIDEO>
+    # =====================================================
 
-    video_matches = re.findall(
+    matches = re.findall(
+
         r'<video[^>]+src=["\']([^"\']+)["\']',
+
         page,
+
         flags=re.IGNORECASE
+
     )
 
 
-    for item in video_matches:
-
-        media_url = clean_media_url(
-            item
-        )
-
-        if (
-            media_url
-            and media_url not in candidates
-        ):
-
-            candidates.append(
-                media_url
-            )
+    candidates.extend(
+        matches
+    )
 
 
-    # -----------------------------------------------------
-    # SOURCE SRC
-    # -----------------------------------------------------
+    # =====================================================
+    # TAG <SOURCE>
+    # =====================================================
 
-    source_matches = re.findall(
+    matches = re.findall(
+
         r'<source[^>]+src=["\']([^"\']+)["\']',
+
         page,
+
         flags=re.IGNORECASE
+
     )
 
 
-    for item in source_matches:
+    candidates.extend(
+        matches
+    )
 
-        media_url = clean_media_url(
-            item
+
+    # =====================================================
+    # REMOVE DUPLICADOS
+    # =====================================================
+
+    candidates = unique_urls(
+        candidates
+    )
+
+
+    print(
+        "SHOPEE CANDIDATOS:",
+        len(candidates)
+    )
+
+
+    # =====================================================
+    # AVALIA TODOS
+    # =====================================================
+
+    analyzed = []
+
+
+    for candidate in candidates:
+
+        info = probe_candidate(
+            candidate,
+            final_url
         )
 
-        if (
-            media_url
-            and media_url not in candidates
-        ):
 
-            candidates.append(
-                media_url
+        if info[
+            "valid"
+        ]:
+
+            analyzed.append(
+                info
             )
 
 
-    # -----------------------------------------------------
-    # VALIDA
-    # -----------------------------------------------------
+    # =====================================================
+    # NENHUM MP4
+    # =====================================================
 
-    valid_candidates = []
-
-
-    for media_url in candidates:
-
-        try:
-
-            media_response = requests.get(
-                media_url,
-
-                headers={
-                    **HEADERS,
-                    "Referer": final_url
-                },
-
-                stream=True,
-                timeout=15
-            )
-
-
-            content_type = (
-                media_response
-                .headers
-                .get(
-                    "content-type",
-                    ""
-                )
-                .lower()
-            )
-
-
-            if (
-                media_response.status_code < 400
-                and (
-                    "video" in content_type
-                    or ".mp4" in media_url.lower()
-                )
-            ):
-
-                valid_candidates.append(
-                    media_url
-                )
-
-
-            media_response.close()
-
-
-        except Exception as error:
-
-            print(
-                "ERRO VALIDANDO MP4:",
-                error
-            )
-
-
-    if valid_candidates:
+    if not analyzed:
 
         return {
-            "success": True,
-            "platform": "Shopee",
-            "url": valid_candidates[0],
-            "resolved_url": final_url,
+
+            "success":
+                False,
+
+            "platform":
+                "Shopee",
+
+            "resolved_url":
+                final_url,
+
             "candidates_found":
-                len(valid_candidates)
+                len(
+                    candidates
+                ),
+
+            "error": (
+                "A página foi aberta, "
+                "mas não encontrei um MP4 público."
+            )
         }
 
 
-    return {
-        "success": False,
-        "platform": "Shopee",
-        "resolved_url": final_url,
-        "candidates_found":
-            len(candidates),
+    # =====================================================
+    # MELHOR VERSÃO
+    # =====================================================
 
-        "error": (
-            "Não encontrei uma URL "
-            "MP4 pública."
-        )
+    analyzed.sort(
+
+        key=lambda item:
+            item.get(
+                "score",
+                0
+            ),
+
+        reverse=True
+
+    )
+
+
+    best = analyzed[
+        0
+    ]
+
+
+    print(
+        "SHOPEE ESCOLHIDO:",
+        best["url"]
+    )
+
+
+    print(
+        "TAMANHO:",
+        best["size"]
+    )
+
+
+    print(
+        "WATERMARK HINT:",
+        best[
+            "watermark_hint"
+        ]
+    )
+
+
+    return {
+
+        "success":
+            True,
+
+        "platform":
+            "Shopee",
+
+        "url":
+            best["url"],
+
+        "file_size":
+            best["size"],
+
+        "content_type":
+            best["content_type"],
+
+        "watermark_hint":
+            best[
+                "watermark_hint"
+            ],
+
+        "resolved_url":
+            final_url,
+
+        "candidates_found":
+            len(
+                analyzed
+            )
     }
 
 
 # =========================================================
-# OUTRAS PLATAFORMAS
+# YT-DLP
 # =========================================================
 
 def extract_with_ytdlp(url):
 
     ydl_opts = {
 
-        "quiet": True,
+        "quiet":
+            True,
 
-        "no_warnings": True,
+        "no_warnings":
+            True,
 
-        "skip_download": True,
+        "skip_download":
+            True,
+
+        # Queremos arquivo único MP4,
+        # porque o Telegram precisa conseguir
+        # acessar diretamente.
 
         "format": (
+            "best[ext=mp4][vcodec!=none][acodec!=none]/"
             "best[ext=mp4]/"
             "best"
         ),
@@ -567,97 +708,190 @@ def extract_with_ytdlp(url):
     if not video_url:
 
         formats = (
-            info.get("formats")
+            info.get(
+                "formats"
+            )
             or []
         )
 
 
-        valid_formats = []
+        candidates = []
 
 
         for item in formats:
 
-            if not item.get("url"):
+            media_url = item.get(
+                "url"
+            )
+
+
+            if not media_url:
                 continue
+
 
             vcodec = item.get(
                 "vcodec"
             )
 
+
+            acodec = item.get(
+                "acodec"
+            )
+
+
             if (
-                vcodec
-                and vcodec != "none"
+                not vcodec
+                or vcodec == "none"
             ):
+                continue
 
-                valid_formats.append(
-                    item
+
+            candidates.append(
+                item
+            )
+
+
+        candidates.sort(
+
+            key=lambda item: (
+
+                1
+                if (
+                    item.get(
+                        "ext"
+                    ) == "mp4"
                 )
+                else 0,
 
+                1
+                if (
+                    item.get(
+                        "acodec"
+                    )
+                    and
+                    item.get(
+                        "acodec"
+                    ) != "none"
+                )
+                else 0,
 
-        valid_formats.sort(
+                item.get(
+                    "height"
+                ) or 0,
 
-            key=lambda x: (
-                x.get("height") or 0,
-                x.get("tbr") or 0
+                item.get(
+                    "tbr"
+                ) or 0
+
             ),
 
             reverse=True
         )
 
 
-        if valid_formats:
+        if candidates:
 
-            video_url = (
-                valid_formats[0]
-                .get("url")
+            selected = candidates[
+                0
+            ]
+
+
+            video_url = selected.get(
+                "url"
             )
+
+
+            height = selected.get(
+                "height"
+            )
+
+
+        else:
+
+            height = info.get(
+                "height"
+            )
+
+
+    else:
+
+        height = info.get(
+            "height"
+        )
 
 
     if not video_url:
 
         return {
-            "success": False,
+
+            "success":
+                False,
+
             "error": (
-                "Vídeo encontrado, "
-                "mas não encontrei a mídia."
+                "Vídeo identificado, "
+                "mas não encontrei uma URL direta."
             )
         }
 
 
     return {
-        "success": True,
+
+        "success":
+            True,
 
         "title":
-            info.get("title"),
+            info.get(
+                "title"
+            ),
 
         "platform":
-            info.get("extractor_key")
-            or info.get("extractor"),
+            (
+                info.get(
+                    "extractor_key"
+                )
+                or
+                info.get(
+                    "extractor"
+                )
+            ),
 
         "width":
-            info.get("width"),
+            info.get(
+                "width"
+            ),
 
         "height":
-            info.get("height"),
+            height,
 
         "duration":
-            info.get("duration"),
+            info.get(
+                "duration"
+            ),
 
         "thumbnail":
-            info.get("thumbnail"),
+            info.get(
+                "thumbnail"
+            ),
 
         "url":
             video_url
     }
 
 
+# =========================================================
+# EXTRATOR PRINCIPAL
+# =========================================================
+
 def extract_video(url):
 
-    if is_shopee(url):
+    if is_shopee(
+        url
+    ):
 
         return extract_shopee_video(
             url
         )
+
 
     return extract_with_ytdlp(
         url
@@ -665,822 +899,24 @@ def extract_video(url):
 
 
 # =========================================================
-# TELEGRAM MESSAGE
-# =========================================================
-
-def send_telegram_message(
-    chat_id,
-    thread_id,
-    text,
-    disable_preview=True
-):
-
-    if not TELEGRAM_TOKEN:
-        return False
-
-
-    endpoint = (
-        "https://api.telegram.org/bot"
-        + TELEGRAM_TOKEN
-        + "/sendMessage"
-    )
-
-
-    payload = {
-
-        "chat_id":
-            chat_id,
-
-        "text":
-            text,
-
-        "disable_web_page_preview":
-            disable_preview
-    }
-
-
-    if thread_id:
-
-        payload[
-            "message_thread_id"
-        ] = int(thread_id)
-
-
-    try:
-
-        response = requests.post(
-            endpoint,
-            json=payload,
-            timeout=30
-        )
-
-
-        print(
-            "SEND MESSAGE:",
-            response.status_code,
-            response.text
-        )
-
-
-        return response.ok
-
-
-    except Exception as error:
-
-        print(
-            "ERRO SEND MESSAGE:",
-            error
-        )
-
-        return False
-
-
-# =========================================================
-# BAIXA O MP4 TEMPORARIAMENTE
-# =========================================================
-
-def download_video_file(
-    video_url
-):
-
-    temp_file = tempfile.NamedTemporaryFile(
-        suffix=".mp4",
-        delete=False
-    )
-
-    path = temp_file.name
-
-    temp_file.close()
-
-
-    total = 0
-
-
-    try:
-
-        with requests.get(
-            video_url,
-            headers=HEADERS,
-            stream=True,
-            timeout=60
-        ) as response:
-
-            response.raise_for_status()
-
-
-            content_length = response.headers.get(
-                "content-length"
-            )
-
-
-            if content_length:
-
-                size = int(
-                    content_length
-                )
-
-                if (
-                    size >
-                    MAX_TELEGRAM_FILE_SIZE
-                ):
-
-                    os.unlink(
-                        path
-                    )
-
-                    return {
-                        "success": False,
-                        "too_large": True,
-                        "size": size
-                    }
-
-
-            with open(
-                path,
-                "wb"
-            ) as file:
-
-                for chunk in response.iter_content(
-                    chunk_size=1024 * 1024
-                ):
-
-                    if not chunk:
-                        continue
-
-
-                    total += len(
-                        chunk
-                    )
-
-
-                    if (
-                        total >
-                        MAX_TELEGRAM_FILE_SIZE
-                    ):
-
-                        file.close()
-
-                        os.unlink(
-                            path
-                        )
-
-                        return {
-                            "success": False,
-                            "too_large": True,
-                            "size": total
-                        }
-
-
-                    file.write(
-                        chunk
-                    )
-
-
-        return {
-            "success": True,
-            "path": path,
-            "size": total
-        }
-
-
-    except Exception as error:
-
-        try:
-
-            if os.path.exists(
-                path
-            ):
-                os.unlink(
-                    path
-                )
-
-        except Exception:
-            pass
-
-
-        return {
-            "success": False,
-            "error": str(error)
-        }
-
-
-# =========================================================
-# ENVIA MP4 DIRETO AO TELEGRAM
-# =========================================================
-
-def send_telegram_video(
-    chat_id,
-    thread_id,
-    file_path,
-    caption
-):
-
-    endpoint = (
-        "https://api.telegram.org/bot"
-        + TELEGRAM_TOKEN
-        + "/sendVideo"
-    )
-
-
-    data = {
-
-        "chat_id":
-            str(chat_id),
-
-        "caption":
-            caption,
-
-        "supports_streaming":
-            "true"
-    }
-
-
-    if thread_id:
-
-        data[
-            "message_thread_id"
-        ] = str(thread_id)
-
-
-    try:
-
-        with open(
-            file_path,
-            "rb"
-        ) as video_file:
-
-            files = {
-
-                "video": (
-                    "video.mp4",
-                    video_file,
-                    "video/mp4"
-                )
-
-            }
-
-
-            response = requests.post(
-                endpoint,
-                data=data,
-                files=files,
-                timeout=180
-            )
-
-
-        print(
-            "SEND VIDEO:",
-            response.status_code,
-            response.text
-        )
-
-
-        return response.ok
-
-
-    except Exception as error:
-
-        print(
-            "ERRO SEND VIDEO:",
-            error
-        )
-
-        return False
-
-
-# =========================================================
-# FALLBACK COMO ARQUIVO
-# =========================================================
-
-def send_telegram_document(
-    chat_id,
-    thread_id,
-    file_path,
-    caption
-):
-
-    endpoint = (
-        "https://api.telegram.org/bot"
-        + TELEGRAM_TOKEN
-        + "/sendDocument"
-    )
-
-
-    data = {
-
-        "chat_id":
-            str(chat_id),
-
-        "caption":
-            caption
-    }
-
-
-    if thread_id:
-
-        data[
-            "message_thread_id"
-        ] = str(thread_id)
-
-
-    try:
-
-        with open(
-            file_path,
-            "rb"
-        ) as video_file:
-
-            files = {
-
-                "document": (
-                    "video.mp4",
-                    video_file,
-                    "video/mp4"
-                )
-
-            }
-
-
-            response = requests.post(
-                endpoint,
-                data=data,
-                files=files,
-                timeout=180
-            )
-
-
-        print(
-            "SEND DOCUMENT:",
-            response.status_code,
-            response.text
-        )
-
-
-        return response.ok
-
-
-    except Exception as error:
-
-        print(
-            "ERRO DOCUMENT:",
-            error
-        )
-
-        return False
-
-
-# =========================================================
-# DURAÇÃO
-# =========================================================
-
-def format_duration(seconds):
-
-    if not seconds:
-        return None
-
-
-    try:
-
-        seconds = int(
-            float(seconds)
-        )
-
-    except Exception:
-
-        return None
-
-
-    minutes = (
-        seconds // 60
-    )
-
-    remaining = (
-        seconds % 60
-    )
-
-
-    return (
-        f"{minutes}:"
-        f"{remaining:02d}"
-    )
-
-
-# =========================================================
-# JOB
-# =========================================================
-
-def process_job(data):
-
-    url = data.get(
-        "url"
-    )
-
-    chat_id = data.get(
-        "chat_id"
-    )
-
-    thread_id = data.get(
-        "thread_id"
-    )
-
-    job_id = str(
-        data.get(
-            "job_id",
-            ""
-        )
-    )
-
-    platform_received = data.get(
-        "platform",
-        "Vídeo"
-    )
-
-
-    update_job_status(
-        job_id,
-        "processing"
-    )
-
-
-    print(
-        "PROCESSANDO JOB:",
-        job_id,
-        url
-    )
-
-
-    result = None
-
-    last_error = None
-
-
-    # -----------------------------------------------------
-    # TENTA EXTRAÇÃO ATÉ 3 VEZES
-    # -----------------------------------------------------
-
-    for attempt in range(
-        1,
-        4
-    ):
-
-        try:
-
-            print(
-                f"EXTRAÇÃO {attempt}/3"
-            )
-
-
-            result = extract_video(
-                url
-            )
-
-
-            if (
-                result
-                and result.get("success")
-                and result.get("url")
-            ):
-                break
-
-
-            last_error = (
-                result.get("error")
-                if result
-                else "Erro desconhecido."
-            )
-
-
-        except Exception as error:
-
-            last_error = str(
-                error
-            )
-
-
-        if attempt < 3:
-
-            time.sleep(
-                3
-            )
-
-
-    # -----------------------------------------------------
-    # NÃO ENCONTROU
-    # -----------------------------------------------------
-
-    if (
-        not result
-        or not result.get("success")
-        or not result.get("url")
-    ):
-
-        update_job_status(
-            job_id,
-            "failed"
-        )
-
-
-        send_telegram_message(
-            chat_id,
-            thread_id,
-
-            "❌ Não consegui localizar o vídeo.\n\n"
-            + (
-                last_error
-                or "Erro desconhecido."
-            )
-        )
-
-
-        return
-
-
-    platform = (
-        result.get("platform")
-        or platform_received
-    )
-
-
-    caption = (
-        "✅ Vídeo pronto!\n\n"
-        f"📱 Plataforma: {platform}"
-    )
-
-
-    title = result.get(
-        "title"
-    )
-
-
-    if title:
-
-        caption += (
-            "\n\n🎬 "
-            + str(title)[:500]
-        )
-
-
-    height = result.get(
-        "height"
-    )
-
-
-    if height:
-
-        caption += (
-            "\n\n📺 Qualidade: "
-            + str(height)
-            + "p"
-        )
-
-
-    duration = format_duration(
-        result.get(
-            "duration"
-        )
-    )
-
-
-    if duration:
-
-        caption += (
-            "\n\n⏱ Duração: "
-            + duration
-        )
-
-
-    # -----------------------------------------------------
-    # BAIXA MP4 PARA O RENDER
-    # -----------------------------------------------------
-
-    downloaded = download_video_file(
-        result["url"]
-    )
-
-
-    # -----------------------------------------------------
-    # ARQUIVO MUITO GRANDE
-    # -----------------------------------------------------
-
-    if (
-        not downloaded.get(
-            "success"
-        )
-    ):
-
-        update_job_status(
-            job_id,
-            "fallback"
-        )
-
-
-        # SOMENTE UM LINK.
-        send_telegram_message(
-            chat_id,
-            thread_id,
-
-            "✅ Vídeo encontrado!\n\n"
-
-            f"📱 Plataforma: {platform}\n\n"
-
-            "📥 O arquivo é grande demais para "
-            "eu enviar diretamente pelo Telegram.\n\n"
-
-            + result["url"]
-        )
-
-
-        return
-
-
-    file_path = downloaded[
-        "path"
-    ]
-
-
-    try:
-
-        # -------------------------------------------------
-        # PRIMEIRA OPÇÃO: VÍDEO NORMAL
-        # -------------------------------------------------
-
-        sent = send_telegram_video(
-            chat_id,
-            thread_id,
-            file_path,
-            caption
-        )
-
-
-        # -------------------------------------------------
-        # SEGUNDA OPÇÃO: ARQUIVO MP4
-        # -------------------------------------------------
-
-        if not sent:
-
-            sent = send_telegram_document(
-                chat_id,
-                thread_id,
-                file_path,
-                caption
-            )
-
-
-        # -------------------------------------------------
-        # ÚLTIMO FALLBACK: UM ÚNICO LINK
-        # -------------------------------------------------
-
-        if not sent:
-
-            send_telegram_message(
-                chat_id,
-                thread_id,
-
-                "✅ Vídeo encontrado!\n\n"
-
-                f"📱 Plataforma: {platform}\n\n"
-
-                "📥 Não consegui anexar o MP4. "
-                "Use este link:\n\n"
-
-                + result["url"]
-            )
-
-
-            update_job_status(
-                job_id,
-                "fallback"
-            )
-
-
-        else:
-
-            update_job_status(
-                job_id,
-                "completed"
-            )
-
-
-    finally:
-
-        try:
-
-            if os.path.exists(
-                file_path
-            ):
-
-                os.unlink(
-                    file_path
-                )
-
-        except Exception:
-            pass
-
-
-    print(
-        "JOB FINALIZADO:",
-        job_id
-    )
-
-
-# =========================================================
-# ENQUEUE
-# =========================================================
-
-@app.post("/enqueue")
-def enqueue():
-
-    if not valid_api_secret():
-
-        return jsonify({
-            "success": False,
-            "error": "Não autorizado."
-        }), 401
-
-
-    data = (
-        request.get_json(
-            silent=True
-        )
-        or {}
-    )
-
-
-    url = data.get(
-        "url"
-    )
-
-    chat_id = data.get(
-        "chat_id"
-    )
-
-    job_id = str(
-        data.get(
-            "job_id",
-            ""
-        )
-    )
-
-
-    if not url:
-
-        return jsonify({
-            "success": False,
-            "error": "URL não informada."
-        }), 400
-
-
-    if not chat_id:
-
-        return jsonify({
-            "success": False,
-            "error": "chat_id não informado."
-        }), 400
-
-
-    if not job_id:
-
-        return jsonify({
-            "success": False,
-            "error": "job_id não informado."
-        }), 400
-
-
-    # -----------------------------------------------------
-    # DUPLICADO NÃO É PROCESSADO NOVAMENTE
-    # -----------------------------------------------------
-
-    if not register_job(
-        job_id
-    ):
-
-        return jsonify({
-            "success": True,
-            "queued": False,
-            "duplicate": True,
-            "job_id": job_id
-        }), 200
-
-
-    executor.submit(
-        process_job,
-        data.copy()
-    )
-
-
-    return jsonify({
-        "success": True,
-        "queued": True,
-        "job_id": job_id
-    }), 202
-
-
-# =========================================================
-# TESTE SINCRONO
+# /EXTRACT
 # =========================================================
 
 @app.post("/extract")
 def extract():
+
+    if not valid_api_secret():
+
+        return jsonify({
+
+            "success":
+                False,
+
+            "error":
+                "Não autorizado."
+
+        }), 401
+
 
     try:
 
@@ -1500,8 +936,13 @@ def extract():
         if not url:
 
             return jsonify({
-                "success": False,
-                "error": "URL não informada."
+
+                "success":
+                    False,
+
+                "error":
+                    "URL não informada."
+
             }), 400
 
 
@@ -1510,20 +951,36 @@ def extract():
         )
 
 
+        if result.get(
+            "success"
+        ):
+
+            return jsonify(
+                result
+            ), 200
+
+
         return jsonify(
             result
-        ), (
-            200
-            if result.get("success")
-            else 422
-        )
+        ), 422
 
 
     except Exception as error:
 
+        print(
+            "ERRO /extract:",
+            error
+        )
+
+
         return jsonify({
-            "success": False,
-            "error": str(error)
+
+            "success":
+                False,
+
+            "error":
+                str(error)
+
         }), 500
 
 
@@ -1534,15 +991,24 @@ def extract():
 if __name__ == "__main__":
 
     port = int(
+
         os.environ.get(
             "PORT",
             10000
         )
+
     )
 
 
     app.run(
-        host="0.0.0.0",
-        port=port,
-        threaded=True
+
+        host=
+            "0.0.0.0",
+
+        port=
+            port,
+
+        threaded=
+            True
+
     )
