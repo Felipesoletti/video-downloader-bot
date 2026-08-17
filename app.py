@@ -26,9 +26,11 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
+
     "Accept-Language": (
         "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
     ),
+
     "Accept": (
         "text/html,application/xhtml+xml,"
         "application/xml;q=0.9,"
@@ -47,8 +49,7 @@ def home():
     return jsonify({
         "status": "ok",
         "service": "video-downloader-bot",
-        "version": "4.0",
-        "mode": "extract-only"
+        "version": "5.0-diagnostic"
     })
 
 
@@ -123,7 +124,9 @@ def clean_media_url(value):
     if not value:
         return None
 
-    value = html.unescape(value)
+    value = html.unescape(
+        value
+    )
 
     value = value.replace(
         "\\u002F",
@@ -140,6 +143,11 @@ def clean_media_url(value):
         "&"
     )
 
+    value = value.replace(
+        "&amp;",
+        "&"
+    )
+
     if value.startswith("//"):
         value = "https:" + value
 
@@ -147,12 +155,13 @@ def clean_media_url(value):
 
 
 # =========================================================
-# ADICIONA CANDIDATO SEM REPETIR
+# ADICIONA CANDIDATO SEM DUPLICAR
 # =========================================================
 
 def add_candidate(
     candidates,
-    value
+    value,
+    source
 ):
 
     value = clean_media_url(
@@ -162,29 +171,187 @@ def add_candidate(
     if not value:
         return
 
-    if value in candidates:
-        return
+    for item in candidates:
 
-    candidates.append(
-        value
+        if (
+            item["url"] ==
+            value
+        ):
+            return
+
+    candidates.append({
+        "url": value,
+        "source": source
+    })
+
+
+# =========================================================
+# ANALISA CANDIDATO
+# =========================================================
+
+def inspect_candidate(
+    candidate,
+    referer
+):
+
+    media_url = candidate[
+        "url"
+    ]
+
+    result = {
+        "url":
+            media_url,
+
+        "source":
+            candidate.get(
+                "source"
+            ),
+
+        "valid":
+            False,
+
+        "status":
+            None,
+
+        "content_type":
+            "",
+
+        "content_length":
+            0,
+
+        "final_url":
+            media_url,
+
+        "watermark_hint":
+            False
+    }
+
+
+    lower = (
+        media_url.lower()
     )
 
 
+    watermark_terms = [
+        "watermark",
+        "watermarked",
+        "with_logo",
+        "with-logo",
+        "overlay",
+        "logo",
+        "wm="
+    ]
+
+
+    result[
+        "watermark_hint"
+    ] = any(
+        term in lower
+        for term in watermark_terms
+    )
+
+
+    try:
+
+        response = requests.get(
+            media_url,
+
+            headers={
+                **HEADERS,
+                "Referer":
+                    referer
+            },
+
+            stream=True,
+
+            allow_redirects=True,
+
+            timeout=20
+        )
+
+
+        result[
+            "status"
+        ] = response.status_code
+
+
+        result[
+            "final_url"
+        ] = response.url
+
+
+        result[
+            "content_type"
+        ] = (
+            response.headers
+            .get(
+                "content-type",
+                ""
+            )
+            .lower()
+        )
+
+
+        content_length = (
+            response.headers
+            .get(
+                "content-length"
+            )
+        )
+
+
+        if content_length:
+
+            try:
+
+                result[
+                    "content_length"
+                ] = int(
+                    content_length
+                )
+
+            except Exception:
+                pass
+
+
+        if (
+            response.status_code < 400
+            and (
+                "video" in result[
+                    "content_type"
+                ]
+                or
+                ".mp4" in lower
+            )
+        ):
+
+            result[
+                "valid"
+            ] = True
+
+
+        response.close()
+
+
+    except Exception as error:
+
+        result[
+            "error"
+        ] = str(
+            error
+        )
+
+
+    return result
+
+
 # =========================================================
-# SHOPEE
-#
-# IMPORTANTE:
-# Voltamos ao método original que funcionou:
-#
-# 1. encontra os MP4
-# 2. mantém a ordem original da página
-# 3. valida
-# 4. usa o PRIMEIRO válido
-#
-# Não fazemos ranking que possa trocar a variante.
+# COLETA TODOS OS CANDIDATOS SHOPEE
 # =========================================================
 
-def extract_shopee_video(url):
+def collect_shopee_candidates(
+    url
+):
 
     final_url = resolve_url(
         url
@@ -208,16 +375,16 @@ def extract_shopee_video(url):
 
 
     # =====================================================
-    # 1. MP4 DIRETO
+    # MP4 DIRETO
     # =====================================================
 
-    patterns = [
+    direct_patterns = [
         r'https?://[^"\']+\.mp4[^"\']*',
         r'https?:\\?/\\?/[^"\']+\.mp4[^"\']*',
     ]
 
 
-    for pattern in patterns:
+    for pattern in direct_patterns:
 
         matches = re.findall(
             pattern,
@@ -230,25 +397,41 @@ def extract_shopee_video(url):
 
             add_candidate(
                 candidates,
-                item
+                item,
+                "direct_mp4"
             )
 
 
     # =====================================================
-    # 2. CAMPOS JSON
+    # CAMPOS JSON
     # =====================================================
 
-    json_patterns = [
-        r'"videoUrl"\s*:\s*"([^"]+)"',
-        r'"video_url"\s*:\s*"([^"]+)"',
-        r'"playUrl"\s*:\s*"([^"]+)"',
-        r'"play_url"\s*:\s*"([^"]+)"',
-        r'"url"\s*:\s*"(https?:[^"]+\.mp4[^"]*)"',
-        r'"src"\s*:\s*"(https?:[^"]+\.mp4[^"]*)"',
-    ]
+    json_patterns = {
+
+        "videoUrl":
+            r'"videoUrl"\s*:\s*"([^"]+)"',
+
+        "video_url":
+            r'"video_url"\s*:\s*"([^"]+)"',
+
+        "playUrl":
+            r'"playUrl"\s*:\s*"([^"]+)"',
+
+        "play_url":
+            r'"play_url"\s*:\s*"([^"]+)"',
+
+        "url":
+            r'"url"\s*:\s*"(https?:[^"]+\.mp4[^"]*)"',
 
 
-    for pattern in json_patterns:
+        "src":
+            r'"src"\s*:\s*"(https?:[^"]+\.mp4[^"]*)"',
+    }
+
+
+    for source_name, pattern in (
+        json_patterns.items()
+    ):
 
         matches = re.findall(
             pattern,
@@ -261,12 +444,13 @@ def extract_shopee_video(url):
 
             add_candidate(
                 candidates,
-                item
+                item,
+                source_name
             )
 
 
     # =====================================================
-    # 3. TAG VIDEO
+    # VIDEO SRC
     # =====================================================
 
     matches = re.findall(
@@ -280,12 +464,13 @@ def extract_shopee_video(url):
 
         add_candidate(
             candidates,
-            item
+            item,
+            "video_tag"
         )
 
 
     # =====================================================
-    # 4. TAG SOURCE
+    # SOURCE SRC
     # =====================================================
 
     matches = re.findall(
@@ -299,108 +484,189 @@ def extract_shopee_video(url):
 
         add_candidate(
             candidates,
-            item
+            item,
+            "source_tag"
         )
 
 
-    print(
-        "SHOPEE - CANDIDATOS:",
-        len(candidates)
-    )
+    analyzed = []
 
 
-    # =====================================================
-    # 5. TESTA NA ORDEM
-    # =====================================================
+    for candidate in candidates:
 
-    for index, media_url in enumerate(
-        candidates
-    ):
-
-        try:
-
-            media_response = requests.get(
-                media_url,
-
-                headers={
-                    **HEADERS,
-                    "Referer": final_url
-                },
-
-                stream=True,
-
-                allow_redirects=True,
-
-                timeout=15
+        analyzed.append(
+            inspect_candidate(
+                candidate,
+                final_url
             )
-
-
-            content_type = (
-                media_response
-                .headers
-                .get(
-                    "content-type",
-                    ""
-                )
-                .lower()
-            )
-
-
-            status = (
-                media_response.status_code
-            )
-
-
-            media_response.close()
-
-
-            if (
-                status < 400
-                and (
-                    "video" in content_type
-                    or ".mp4" in media_url.lower()
-                )
-            ):
-
-                print(
-                    "SHOPEE - MP4 ESCOLHIDO:",
-                    index,
-                    media_url
-                )
-
-
-                return {
-                    "success": True,
-                    "platform": "Shopee",
-                    "url": media_url,
-                    "resolved_url": final_url,
-                    "candidate_index": index,
-                    "candidates_found": len(
-                        candidates
-                    )
-                }
-
-
-        except Exception as error:
-
-            print(
-                "ERRO CANDIDATO:",
-                index,
-                error
-            )
+        )
 
 
     return {
-        "success": False,
-        "platform": "Shopee",
-        "resolved_url": final_url,
-        "candidates_found": len(
-            candidates
-        ),
-        "error": (
-            "A página foi aberta, "
-            "mas não encontrei um MP4 público válido."
+        "resolved_url":
+            final_url,
+
+        "page_length":
+            len(page),
+
+        "candidates":
+            analyzed
+    }
+
+
+# =========================================================
+# ESCOLHE MELHOR CANDIDATO
+# =========================================================
+
+def choose_best_candidate(
+    candidates
+):
+
+    valid = [
+        item
+        for item in candidates
+        if item.get(
+            "valid"
         )
+    ]
+
+
+    if not valid:
+
+        return None
+
+
+    # -----------------------------------------------------
+    # PRIMEIRO TENTA CANDIDATOS SEM INDÍCIO DE WATERMARK
+    # -----------------------------------------------------
+
+    clean_candidates = [
+        item
+        for item in valid
+        if not item.get(
+            "watermark_hint"
+        )
+    ]
+
+
+    pool = (
+        clean_candidates
+        if clean_candidates
+        else valid
+    )
+
+
+    # -----------------------------------------------------
+    # MAIOR ARQUIVO PRIMEIRO
+    # -----------------------------------------------------
+
+    pool.sort(
+
+        key=lambda item:
+            item.get(
+                "content_length",
+                0
+            ),
+
+        reverse=True
+
+    )
+
+
+    return pool[0]
+
+
+# =========================================================
+# EXTRATOR SHOPEE
+# =========================================================
+
+def extract_shopee_video(
+    url
+):
+
+    diagnostic = (
+        collect_shopee_candidates(
+            url
+        )
+    )
+
+
+    best = (
+        choose_best_candidate(
+            diagnostic[
+                "candidates"
+            ]
+        )
+    )
+
+
+    if not best:
+
+        return {
+
+            "success":
+                False,
+
+            "platform":
+                "Shopee",
+
+            "resolved_url":
+                diagnostic[
+                    "resolved_url"
+                ],
+
+            "candidates":
+                diagnostic[
+                    "candidates"
+                ],
+
+            "error":
+                (
+                    "Não encontrei "
+                    "MP4 público válido."
+                )
+        }
+
+
+    return {
+
+        "success":
+            True,
+
+        "platform":
+            "Shopee",
+
+        "url":
+            best[
+                "url"
+            ],
+
+        "selected_source":
+            best.get(
+                "source"
+            ),
+
+        "selected_size":
+            best.get(
+                "content_length"
+            ),
+
+        "watermark_hint":
+            best.get(
+                "watermark_hint"
+            ),
+
+        "resolved_url":
+            diagnostic[
+                "resolved_url"
+            ],
+
+        "candidates_found":
+            len(
+                diagnostic[
+                    "candidates"
+                ]
+            )
     }
 
 
@@ -408,23 +674,28 @@ def extract_shopee_video(url):
 # YT-DLP
 # =========================================================
 
-def extract_with_ytdlp(url):
+def extract_with_ytdlp(
+    url
+):
 
     ydl_opts = {
 
-        "quiet": True,
+        "quiet":
+            True,
 
-        "no_warnings": True,
+        "no_warnings":
+            True,
 
-        "skip_download": True,
-
-        # Prefere MP4 único com áudio + vídeo.
+        "skip_download":
+            True,
 
         "format": (
-            "best[ext=mp4][vcodec!=none][acodec!=none]/"
+            "best[ext=mp4]"
+            "[vcodec!=none]"
+            "[acodec!=none]/"
             "best[ext=mp4]/"
             "best"
-        ),
+        )
     }
 
 
@@ -437,6 +708,7 @@ def extract_with_ytdlp(url):
             download=False
         )
 
+
         info = ydl.sanitize_info(
             info
         )
@@ -447,133 +719,58 @@ def extract_with_ytdlp(url):
     )
 
 
-    selected_height = info.get(
-        "height"
-    )
-
-
-    # =====================================================
-    # FALLBACK
-    # =====================================================
-
-    if not video_url:
-
-        formats = (
-            info.get("formats")
-            or []
-        )
-
-
-        valid_formats = []
-
-
-        for item in formats:
-
-            media_url = item.get(
-                "url"
-            )
-
-
-            if not media_url:
-                continue
-
-
-            vcodec = item.get(
-                "vcodec"
-            )
-
-
-            if (
-                not vcodec
-                or vcodec == "none"
-            ):
-                continue
-
-
-            valid_formats.append(
-                item
-            )
-
-
-        valid_formats.sort(
-
-            key=lambda item: (
-
-                1
-                if item.get("ext") == "mp4"
-                else 0,
-
-                1
-                if (
-                    item.get("acodec")
-                    and
-                    item.get("acodec") != "none"
-                )
-                else 0,
-
-                item.get("height") or 0,
-
-                item.get("tbr") or 0
-
-            ),
-
-            reverse=True
-        )
-
-
-        if valid_formats:
-
-            selected = (
-                valid_formats[0]
-            )
-
-
-            video_url = selected.get(
-                "url"
-            )
-
-
-            selected_height = selected.get(
-                "height"
-            )
-
-
     if not video_url:
 
         return {
-            "success": False,
-            "error": (
-                "Vídeo identificado, "
-                "mas não encontrei uma URL direta."
-            )
+
+            "success":
+                False,
+
+            "error":
+                "URL de vídeo não encontrada."
         }
 
 
     return {
 
-        "success": True,
+        "success":
+            True,
 
         "title":
-            info.get("title"),
+            info.get(
+                "title"
+            ),
 
         "platform":
             (
-                info.get("extractor_key")
+                info.get(
+                    "extractor_key"
+                )
                 or
-                info.get("extractor")
+                info.get(
+                    "extractor"
+                )
             ),
 
         "width":
-            info.get("width"),
+            info.get(
+                "width"
+            ),
 
         "height":
-            selected_height,
+            info.get(
+                "height"
+            ),
 
         "duration":
-            info.get("duration"),
+            info.get(
+                "duration"
+            ),
 
         "thumbnail":
-            info.get("thumbnail"),
+            info.get(
+                "thumbnail"
+            ),
 
         "url":
             video_url
@@ -581,17 +778,21 @@ def extract_with_ytdlp(url):
 
 
 # =========================================================
-# EXTRATOR PRINCIPAL
+# PRINCIPAL
 # =========================================================
 
-def extract_video(url):
+def extract_video(
+    url
+):
 
     if is_shopee(
         url
     ):
 
-        return extract_shopee_video(
-            url
+        return (
+            extract_shopee_video(
+                url
+            )
         )
 
 
@@ -610,8 +811,13 @@ def extract():
     if not valid_api_secret():
 
         return jsonify({
-            "success": False,
-            "error": "Não autorizado."
+
+            "success":
+                False,
+
+            "error":
+                "Não autorizado."
+
         }), 401
 
 
@@ -633,15 +839,14 @@ def extract():
         if not url:
 
             return jsonify({
-                "success": False,
-                "error": "URL não informada."
+
+                "success":
+                    False,
+
+                "error":
+                    "URL não informada."
+
             }), 400
-
-
-        print(
-            "EXTRAINDO:",
-            url
-        )
 
 
         result = extract_video(
@@ -649,29 +854,136 @@ def extract():
         )
 
 
-        status = (
+        return jsonify(
+            result
+        ), (
             200
-            if result.get("success")
+            if result.get(
+                "success"
+            )
             else 422
         )
 
 
-        return jsonify(
-            result
-        ), status
-
-
     except Exception as error:
 
-        print(
-            "ERRO /extract:",
-            error
+        return jsonify({
+
+            "success":
+                False,
+
+            "error":
+                str(error)
+
+        }), 500
+
+
+# =========================================================
+# /DIAGNOSTIC
+#
+# ESTE É O ENDPOINT QUE VAMOS USAR AGORA
+# PARA DESCOBRIR A VERSÃO LIMPA.
+# =========================================================
+
+@app.post("/diagnostic")
+def diagnostic():
+
+    if not valid_api_secret():
+
+        return jsonify({
+
+            "success":
+                False,
+
+            "error":
+                "Não autorizado."
+
+        }), 401
+
+
+    try:
+
+        data = (
+            request.get_json(
+                silent=True
+            )
+            or {}
+        )
+
+
+        url = data.get(
+            "url"
+        )
+
+
+        if not url:
+
+            return jsonify({
+
+                "success":
+                    False,
+
+                "error":
+                    "URL não informada."
+
+            }), 400
+
+
+        if not is_shopee(
+            url
+        ):
+
+            return jsonify({
+
+                "success":
+                    False,
+
+                "error":
+                    "Diagnostic é somente Shopee."
+
+            }), 400
+
+
+        result = (
+            collect_shopee_candidates(
+                url
+            )
         )
 
 
         return jsonify({
-            "success": False,
-            "error": str(error)
+
+            "success":
+                True,
+
+            "resolved_url":
+                result[
+                    "resolved_url"
+                ],
+
+            "page_length":
+                result[
+                    "page_length"
+                ],
+
+            "candidates":
+                result[
+                    "candidates"
+                ]
+
+        })
+
+
+    except Exception as error:
+
+        return jsonify({
+
+            "success":
+                False,
+
+            "error":
+                str(error)
+
         }), 500
 
 
