@@ -2,6 +2,8 @@ import os
 import re
 import html
 import time
+import sqlite3
+import tempfile
 import threading
 import requests
 import yt_dlp
@@ -11,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 
 # =========================================================
-# APLICAÇÃO
+# APP
 # =========================================================
 
 app = Flask(__name__)
@@ -38,9 +40,13 @@ MAX_WORKERS = int(
     )
 )
 
+MAX_TELEGRAM_FILE_SIZE = (
+    49 * 1024 * 1024
+)
+
 
 # =========================================================
-# FILA DE PROCESSAMENTO
+# FILA
 # =========================================================
 
 executor = ThreadPoolExecutor(
@@ -48,13 +54,116 @@ executor = ThreadPoolExecutor(
 )
 
 
-# Evita processar o mesmo update do Telegram
-# duas vezes caso o webhook seja reenviado.
+# =========================================================
+# BANCO LOCAL DE JOBS
+#
+# Evita que o mesmo job seja executado várias vezes.
+# =========================================================
 
-processed_jobs = {}
-processed_jobs_lock = threading.Lock()
+DB_PATH = "/tmp/video_jobs.sqlite3"
 
-JOB_TTL_SECONDS = 3600
+db_lock = threading.Lock()
+
+
+def init_database():
+
+    with sqlite3.connect(DB_PATH) as conn:
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id TEXT PRIMARY KEY,
+                created_at REAL NOT NULL,
+                status TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.commit()
+
+
+init_database()
+
+
+def register_job(job_id):
+
+    if not job_id:
+        return True
+
+    with db_lock:
+
+        try:
+
+            with sqlite3.connect(
+                DB_PATH
+            ) as conn:
+
+                conn.execute(
+                    """
+                    INSERT INTO jobs (
+                        job_id,
+                        created_at,
+                        status
+                    )
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        time.time(),
+                        "queued"
+                    )
+                )
+
+                conn.commit()
+
+                return True
+
+        except sqlite3.IntegrityError:
+
+            print(
+                "JOB DUPLICADO IGNORADO:",
+                job_id
+            )
+
+            return False
+
+
+def update_job_status(
+    job_id,
+    status
+):
+
+    if not job_id:
+        return
+
+    with db_lock:
+
+        try:
+
+            with sqlite3.connect(
+                DB_PATH
+            ) as conn:
+
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?
+                    WHERE job_id = ?
+                    """,
+                    (
+                        status,
+                        job_id
+                    )
+                )
+
+                conn.commit()
+
+        except Exception as error:
+
+            print(
+                "ERRO STATUS JOB:",
+                error
+            )
 
 
 # =========================================================
@@ -63,14 +172,18 @@ JOB_TTL_SECONDS = 3600
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Mozilla/5.0 "
+        "(Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
+
     "Accept-Language": (
         "pt-BR,pt;q=0.9,"
         "en-US;q=0.8,en;q=0.7"
     ),
+
     "Accept": (
         "text/html,"
         "application/xhtml+xml,"
@@ -92,13 +205,10 @@ def home():
         "status": "ok",
         "service": "video-downloader-bot",
         "mode": "async",
-        "workers": MAX_WORKERS
+        "workers": MAX_WORKERS,
+        "telegram_video": True
     })
 
-
-# =========================================================
-# HEALTH
-# =========================================================
 
 @app.get("/health")
 def health():
@@ -109,52 +219,7 @@ def health():
 
 
 # =========================================================
-# LIMPA JOBS ANTIGOS
-# =========================================================
-
-def cleanup_processed_jobs():
-
-    agora = time.time()
-
-    with processed_jobs_lock:
-
-        expirados = [
-            job_id
-            for job_id, timestamp
-            in processed_jobs.items()
-            if agora - timestamp > JOB_TTL_SECONDS
-        ]
-
-        for job_id in expirados:
-            processed_jobs.pop(
-                job_id,
-                None
-            )
-
-
-# =========================================================
-# MARCA JOB COMO PROCESSADO
-# =========================================================
-
-def register_job(job_id):
-
-    if not job_id:
-        return True
-
-    cleanup_processed_jobs()
-
-    with processed_jobs_lock:
-
-        if job_id in processed_jobs:
-            return False
-
-        processed_jobs[job_id] = time.time()
-
-    return True
-
-
-# =========================================================
-# VALIDA CHAVE DA API
+# SEGURANÇA
 # =========================================================
 
 def valid_api_secret():
@@ -162,21 +227,21 @@ def valid_api_secret():
     if not API_SECRET:
         return True
 
-    received_secret = request.headers.get(
+    received = request.headers.get(
         "X-API-KEY",
         ""
     )
 
-    return received_secret == API_SECRET
+    return received == API_SECRET
 
 
 # =========================================================
-# IDENTIFICA SHOPEE
+# SHOPEE
 # =========================================================
 
 def is_shopee(url):
 
-    link = url.lower()
+    link = str(url).lower()
 
     return (
         "shopee." in link
@@ -184,10 +249,6 @@ def is_shopee(url):
         or "sv.shopee" in link
     )
 
-
-# =========================================================
-# RESOLVE LINK CURTO
-# =========================================================
 
 def resolve_url(url):
 
@@ -202,10 +263,6 @@ def resolve_url(url):
 
     return response.url
 
-
-# =========================================================
-# LIMPA URL DE MÍDIA
-# =========================================================
 
 def clean_media_url(value):
 
@@ -237,10 +294,6 @@ def clean_media_url(value):
     return value
 
 
-# =========================================================
-# SHOPEE
-# =========================================================
-
 def extract_shopee_video(url):
 
     final_url = resolve_url(
@@ -261,13 +314,14 @@ def extract_shopee_video(url):
 
 
     # -----------------------------------------------------
-    # URLs MP4
+    # MP4 DIRETO
     # -----------------------------------------------------
 
     patterns = [
         r'https?://[^"\']+\.mp4[^"\']*',
         r'https?:\\?/\\?/[^"\']+\.mp4[^"\']*',
     ]
+
 
     for pattern in patterns:
 
@@ -287,6 +341,7 @@ def extract_shopee_video(url):
                 media_url
                 and media_url not in candidates
             ):
+
                 candidates.append(
                     media_url
                 )
@@ -304,6 +359,7 @@ def extract_shopee_video(url):
         r'"url"\s*:\s*"(https?:[^"]+\.mp4[^"]*)"',
         r'"src"\s*:\s*"(https?:[^"]+\.mp4[^"]*)"',
     ]
+
 
     for pattern in json_patterns:
 
@@ -323,13 +379,14 @@ def extract_shopee_video(url):
                 media_url
                 and media_url not in candidates
             ):
+
                 candidates.append(
                     media_url
                 )
 
 
     # -----------------------------------------------------
-    # TAG VIDEO
+    # VIDEO SRC
     # -----------------------------------------------------
 
     video_matches = re.findall(
@@ -337,6 +394,7 @@ def extract_shopee_video(url):
         page,
         flags=re.IGNORECASE
     )
+
 
     for item in video_matches:
 
@@ -348,13 +406,14 @@ def extract_shopee_video(url):
             media_url
             and media_url not in candidates
         ):
+
             candidates.append(
                 media_url
             )
 
 
     # -----------------------------------------------------
-    # TAG SOURCE
+    # SOURCE SRC
     # -----------------------------------------------------
 
     source_matches = re.findall(
@@ -362,6 +421,7 @@ def extract_shopee_video(url):
         page,
         flags=re.IGNORECASE
     )
+
 
     for item in source_matches:
 
@@ -373,16 +433,18 @@ def extract_shopee_video(url):
             media_url
             and media_url not in candidates
         ):
+
             candidates.append(
                 media_url
             )
 
 
     # -----------------------------------------------------
-    # VALIDA CANDIDATOS
+    # VALIDA
     # -----------------------------------------------------
 
     valid_candidates = []
+
 
     for media_url in candidates:
 
@@ -390,22 +452,27 @@ def extract_shopee_video(url):
 
             media_response = requests.get(
                 media_url,
+
                 headers={
                     **HEADERS,
                     "Referer": final_url
                 },
+
                 stream=True,
                 timeout=15
             )
 
+
             content_type = (
-                media_response.headers
+                media_response
+                .headers
                 .get(
                     "content-type",
                     ""
                 )
                 .lower()
             )
+
 
             if (
                 media_response.status_code < 400
@@ -419,12 +486,14 @@ def extract_shopee_video(url):
                     media_url
                 )
 
+
             media_response.close()
+
 
         except Exception as error:
 
             print(
-                "Erro validando candidato:",
+                "ERRO VALIDANDO MP4:",
                 error
             )
 
@@ -436,9 +505,8 @@ def extract_shopee_video(url):
             "platform": "Shopee",
             "url": valid_candidates[0],
             "resolved_url": final_url,
-            "candidates_found": len(
-                valid_candidates
-            )
+            "candidates_found":
+                len(valid_candidates)
         }
 
 
@@ -446,30 +514,30 @@ def extract_shopee_video(url):
         "success": False,
         "platform": "Shopee",
         "resolved_url": final_url,
-        "candidates_found": len(
-            candidates
-        ),
+        "candidates_found":
+            len(candidates),
+
         "error": (
-            "A página foi aberta, "
-            "mas não encontrei uma URL "
+            "Não encontrei uma URL "
             "MP4 pública."
         )
     }
 
 
 # =========================================================
-# YT-DLP
+# OUTRAS PLATAFORMAS
 # =========================================================
 
 def extract_with_ytdlp(url):
 
     ydl_opts = {
+
         "quiet": True,
+
         "no_warnings": True,
+
         "skip_download": True,
 
-        # Prioriza arquivo único para conseguirmos
-        # devolver uma URL direta.
         "format": (
             "best[ext=mp4]/"
             "best"
@@ -496,10 +564,6 @@ def extract_with_ytdlp(url):
     )
 
 
-    # -----------------------------------------------------
-    # FALLBACK PARA FORMATS
-    # -----------------------------------------------------
-
     if not video_url:
 
         formats = (
@@ -507,7 +571,9 @@ def extract_with_ytdlp(url):
             or []
         )
 
-        formatos_validos = []
+
+        valid_formats = []
+
 
         for item in formats:
 
@@ -522,24 +588,27 @@ def extract_with_ytdlp(url):
                 vcodec
                 and vcodec != "none"
             ):
-                formatos_validos.append(
+
+                valid_formats.append(
                     item
                 )
 
 
-        formatos_validos.sort(
+        valid_formats.sort(
+
             key=lambda x: (
                 x.get("height") or 0,
                 x.get("tbr") or 0
             ),
+
             reverse=True
         )
 
 
-        if formatos_validos:
+        if valid_formats:
 
             video_url = (
-                formatos_validos[0]
+                valid_formats[0]
                 .get("url")
             )
 
@@ -549,45 +618,43 @@ def extract_with_ytdlp(url):
         return {
             "success": False,
             "error": (
-                "O vídeo foi identificado, "
-                "mas não encontrei uma URL "
-                "de mídia."
+                "Vídeo encontrado, "
+                "mas não encontrei a mídia."
             )
         }
 
 
     return {
         "success": True,
-        "title": info.get(
-            "title"
-        ),
-        "platform": (
+
+        "title":
+            info.get("title"),
+
+        "platform":
             info.get("extractor_key")
-            or info.get("extractor")
-        ),
-        "width": info.get(
-            "width"
-        ),
-        "height": info.get(
-            "height"
-        ),
-        "duration": info.get(
-            "duration"
-        ),
-        "thumbnail": info.get(
-            "thumbnail"
-        ),
-        "url": video_url
+            or info.get("extractor"),
+
+        "width":
+            info.get("width"),
+
+        "height":
+            info.get("height"),
+
+        "duration":
+            info.get("duration"),
+
+        "thumbnail":
+            info.get("thumbnail"),
+
+        "url":
+            video_url
     }
 
-
-# =========================================================
-# EXTRATOR PRINCIPAL
-# =========================================================
 
 def extract_video(url):
 
     if is_shopee(url):
+
         return extract_shopee_video(
             url
         )
@@ -598,7 +665,7 @@ def extract_video(url):
 
 
 # =========================================================
-# ENVIA MENSAGEM PARA TELEGRAM
+# TELEGRAM MESSAGE
 # =========================================================
 
 def send_telegram_message(
@@ -609,11 +676,6 @@ def send_telegram_message(
 ):
 
     if not TELEGRAM_TOKEN:
-
-        print(
-            "TELEGRAM_TOKEN não configurado."
-        )
-
         return False
 
 
@@ -625,23 +687,23 @@ def send_telegram_message(
 
 
     payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": (
+
+        "chat_id":
+            chat_id,
+
+        "text":
+            text,
+
+        "disable_web_page_preview":
             disable_preview
-        )
     }
 
 
     if thread_id:
 
-        try:
-            payload[
-                "message_thread_id"
-            ] = int(thread_id)
-
-        except Exception:
-            pass
+        payload[
+            "message_thread_id"
+        ] = int(thread_id)
 
 
     try:
@@ -649,18 +711,13 @@ def send_telegram_message(
         response = requests.post(
             endpoint,
             json=payload,
-            timeout=20
+            timeout=30
         )
 
 
         print(
-            "TELEGRAM HTTP:",
-            response.status_code
-        )
-
-
-        print(
-            "TELEGRAM:",
+            "SEND MESSAGE:",
+            response.status_code,
             response.text
         )
 
@@ -671,7 +728,7 @@ def send_telegram_message(
     except Exception as error:
 
         print(
-            "ERRO TELEGRAM:",
+            "ERRO SEND MESSAGE:",
             error
         )
 
@@ -679,13 +736,308 @@ def send_telegram_message(
 
 
 # =========================================================
-# FORMATA DURAÇÃO
+# BAIXA O MP4 TEMPORARIAMENTE
+# =========================================================
+
+def download_video_file(
+    video_url
+):
+
+    temp_file = tempfile.NamedTemporaryFile(
+        suffix=".mp4",
+        delete=False
+    )
+
+    path = temp_file.name
+
+    temp_file.close()
+
+
+    total = 0
+
+
+    try:
+
+        with requests.get(
+            video_url,
+            headers=HEADERS,
+            stream=True,
+            timeout=60
+        ) as response:
+
+            response.raise_for_status()
+
+
+            content_length = response.headers.get(
+                "content-length"
+            )
+
+
+            if content_length:
+
+                size = int(
+                    content_length
+                )
+
+                if (
+                    size >
+                    MAX_TELEGRAM_FILE_SIZE
+                ):
+
+                    os.unlink(
+                        path
+                    )
+
+                    return {
+                        "success": False,
+                        "too_large": True,
+                        "size": size
+                    }
+
+
+            with open(
+                path,
+                "wb"
+            ) as file:
+
+                for chunk in response.iter_content(
+                    chunk_size=1024 * 1024
+                ):
+
+                    if not chunk:
+                        continue
+
+
+                    total += len(
+                        chunk
+                    )
+
+
+                    if (
+                        total >
+                        MAX_TELEGRAM_FILE_SIZE
+                    ):
+
+                        file.close()
+
+                        os.unlink(
+                            path
+                        )
+
+                        return {
+                            "success": False,
+                            "too_large": True,
+                            "size": total
+                        }
+
+
+                    file.write(
+                        chunk
+                    )
+
+
+        return {
+            "success": True,
+            "path": path,
+            "size": total
+        }
+
+
+    except Exception as error:
+
+        try:
+
+            if os.path.exists(
+                path
+            ):
+                os.unlink(
+                    path
+                )
+
+        except Exception:
+            pass
+
+
+        return {
+            "success": False,
+            "error": str(error)
+        }
+
+
+# =========================================================
+# ENVIA MP4 DIRETO AO TELEGRAM
+# =========================================================
+
+def send_telegram_video(
+    chat_id,
+    thread_id,
+    file_path,
+    caption
+):
+
+    endpoint = (
+        "https://api.telegram.org/bot"
+        + TELEGRAM_TOKEN
+        + "/sendVideo"
+    )
+
+
+    data = {
+
+        "chat_id":
+            str(chat_id),
+
+        "caption":
+            caption,
+
+        "supports_streaming":
+            "true"
+    }
+
+
+    if thread_id:
+
+        data[
+            "message_thread_id"
+        ] = str(thread_id)
+
+
+    try:
+
+        with open(
+            file_path,
+            "rb"
+        ) as video_file:
+
+            files = {
+
+                "video": (
+                    "video.mp4",
+                    video_file,
+                    "video/mp4"
+                )
+
+            }
+
+
+            response = requests.post(
+                endpoint,
+                data=data,
+                files=files,
+                timeout=180
+            )
+
+
+        print(
+            "SEND VIDEO:",
+            response.status_code,
+            response.text
+        )
+
+
+        return response.ok
+
+
+    except Exception as error:
+
+        print(
+            "ERRO SEND VIDEO:",
+            error
+        )
+
+        return False
+
+
+# =========================================================
+# FALLBACK COMO ARQUIVO
+# =========================================================
+
+def send_telegram_document(
+    chat_id,
+    thread_id,
+    file_path,
+    caption
+):
+
+    endpoint = (
+        "https://api.telegram.org/bot"
+        + TELEGRAM_TOKEN
+        + "/sendDocument"
+    )
+
+
+    data = {
+
+        "chat_id":
+            str(chat_id),
+
+        "caption":
+            caption
+    }
+
+
+    if thread_id:
+
+        data[
+            "message_thread_id"
+        ] = str(thread_id)
+
+
+    try:
+
+        with open(
+            file_path,
+            "rb"
+        ) as video_file:
+
+            files = {
+
+                "document": (
+                    "video.mp4",
+                    video_file,
+                    "video/mp4"
+                )
+
+            }
+
+
+            response = requests.post(
+                endpoint,
+                data=data,
+                files=files,
+                timeout=180
+            )
+
+
+        print(
+            "SEND DOCUMENT:",
+            response.status_code,
+            response.text
+        )
+
+
+        return response.ok
+
+
+    except Exception as error:
+
+        print(
+            "ERRO DOCUMENT:",
+            error
+        )
+
+        return False
+
+
+# =========================================================
+# DURAÇÃO
 # =========================================================
 
 def format_duration(seconds):
 
     if not seconds:
         return None
+
 
     try:
 
@@ -698,9 +1050,13 @@ def format_duration(seconds):
         return None
 
 
-    minutes = seconds // 60
+    minutes = (
+        seconds // 60
+    )
 
-    remaining = seconds % 60
+    remaining = (
+        seconds % 60
+    )
 
 
     return (
@@ -710,7 +1066,7 @@ def format_duration(seconds):
 
 
 # =========================================================
-# PROCESSAMENTO EM BACKGROUND
+# JOB
 # =========================================================
 
 def process_job(data):
@@ -727,26 +1083,40 @@ def process_job(data):
         "thread_id"
     )
 
+    job_id = str(
+        data.get(
+            "job_id",
+            ""
+        )
+    )
+
     platform_received = data.get(
         "platform",
         "Vídeo"
     )
 
 
-    print(
-        "INICIANDO JOB:",
-        url
+    update_job_status(
+        job_id,
+        "processing"
     )
 
 
-    # -----------------------------------------------------
-    # TENTA ATÉ 3 VEZES
-    # -----------------------------------------------------
+    print(
+        "PROCESSANDO JOB:",
+        job_id,
+        url
+    )
+
 
     result = None
 
     last_error = None
 
+
+    # -----------------------------------------------------
+    # TENTA EXTRAÇÃO ATÉ 3 VEZES
+    # -----------------------------------------------------
 
     for attempt in range(
         1,
@@ -756,7 +1126,7 @@ def process_job(data):
         try:
 
             print(
-                f"Tentativa {attempt}/3"
+                f"EXTRAÇÃO {attempt}/3"
             )
 
 
@@ -786,21 +1156,16 @@ def process_job(data):
                 error
             )
 
-            print(
-                "ERRO EXTRAÇÃO:",
-                last_error
-            )
-
 
         if attempt < 3:
 
             time.sleep(
-                4
+                3
             )
 
 
     # -----------------------------------------------------
-    # FALHOU
+    # NÃO ENCONTROU
     # -----------------------------------------------------
 
     if (
@@ -808,6 +1173,12 @@ def process_job(data):
         or not result.get("success")
         or not result.get("url")
     ):
+
+        update_job_status(
+            job_id,
+            "failed"
+        )
+
 
         send_telegram_message(
             chat_id,
@@ -820,12 +1191,9 @@ def process_job(data):
             )
         )
 
+
         return
 
-
-    # -----------------------------------------------------
-    # SUCESSO
-    # -----------------------------------------------------
 
     platform = (
         result.get("platform")
@@ -833,8 +1201,8 @@ def process_job(data):
     )
 
 
-    message = (
-        "✅ Vídeo encontrado!\n\n"
+    caption = (
+        "✅ Vídeo pronto!\n\n"
         f"📱 Plataforma: {platform}"
     )
 
@@ -843,11 +1211,12 @@ def process_job(data):
         "title"
     )
 
+
     if title:
 
-        message += (
+        caption += (
             "\n\n🎬 "
-            + str(title)
+            + str(title)[:500]
         )
 
 
@@ -855,9 +1224,10 @@ def process_job(data):
         "height"
     )
 
+
     if height:
 
-        message += (
+        caption += (
             "\n\n📺 Qualidade: "
             + str(height)
             + "p"
@@ -870,38 +1240,151 @@ def process_job(data):
         )
     )
 
+
     if duration:
 
-        message += (
+        caption += (
             "\n\n⏱ Duração: "
             + duration
         )
 
 
-    message += (
-        "\n\n📥 BAIXAR VÍDEO:\n"
-        + result["url"]
+    # -----------------------------------------------------
+    # BAIXA MP4 PARA O RENDER
+    # -----------------------------------------------------
+
+    downloaded = download_video_file(
+        result["url"]
     )
 
 
-    send_telegram_message(
-        chat_id,
-        thread_id,
-        message
-    )
+    # -----------------------------------------------------
+    # ARQUIVO MUITO GRANDE
+    # -----------------------------------------------------
+
+    if (
+        not downloaded.get(
+            "success"
+        )
+    ):
+
+        update_job_status(
+            job_id,
+            "fallback"
+        )
+
+
+        # SOMENTE UM LINK.
+        send_telegram_message(
+            chat_id,
+            thread_id,
+
+            "✅ Vídeo encontrado!\n\n"
+
+            f"📱 Plataforma: {platform}\n\n"
+
+            "📥 O arquivo é grande demais para "
+            "eu enviar diretamente pelo Telegram.\n\n"
+
+            + result["url"]
+        )
+
+
+        return
+
+
+    file_path = downloaded[
+        "path"
+    ]
+
+
+    try:
+
+        # -------------------------------------------------
+        # PRIMEIRA OPÇÃO: VÍDEO NORMAL
+        # -------------------------------------------------
+
+        sent = send_telegram_video(
+            chat_id,
+            thread_id,
+            file_path,
+            caption
+        )
+
+
+        # -------------------------------------------------
+        # SEGUNDA OPÇÃO: ARQUIVO MP4
+        # -------------------------------------------------
+
+        if not sent:
+
+            sent = send_telegram_document(
+                chat_id,
+                thread_id,
+                file_path,
+                caption
+            )
+
+
+        # -------------------------------------------------
+        # ÚLTIMO FALLBACK: UM ÚNICO LINK
+        # -------------------------------------------------
+
+        if not sent:
+
+            send_telegram_message(
+                chat_id,
+                thread_id,
+
+                "✅ Vídeo encontrado!\n\n"
+
+                f"📱 Plataforma: {platform}\n\n"
+
+                "📥 Não consegui anexar o MP4. "
+                "Use este link:\n\n"
+
+                + result["url"]
+            )
+
+
+            update_job_status(
+                job_id,
+                "fallback"
+            )
+
+
+        else:
+
+            update_job_status(
+                job_id,
+                "completed"
+            )
+
+
+    finally:
+
+        try:
+
+            if os.path.exists(
+                file_path
+            ):
+
+                os.unlink(
+                    file_path
+                )
+
+        except Exception:
+            pass
 
 
     print(
         "JOB FINALIZADO:",
-        url
+        job_id
     )
 
 
 # =========================================================
-# ENDPOINT ASSÍNCRONO
-#
-# Apps Script chama esse endpoint.
-# Ele coloca o vídeo na fila e responde IMEDIATAMENTE.
+# ENQUEUE
 # =========================================================
 
 @app.post("/enqueue")
@@ -931,10 +1414,6 @@ def enqueue():
         "chat_id"
     )
 
-    thread_id = data.get(
-        "thread_id"
-    )
-
     job_id = str(
         data.get(
             "job_id",
@@ -959,8 +1438,16 @@ def enqueue():
         }), 400
 
 
+    if not job_id:
+
+        return jsonify({
+            "success": False,
+            "error": "job_id não informado."
+        }), 400
+
+
     # -----------------------------------------------------
-    # EVITA JOB DUPLICADO
+    # DUPLICADO NÃO É PROCESSADO NOVAMENTE
     # -----------------------------------------------------
 
     if not register_job(
@@ -975,34 +1462,21 @@ def enqueue():
         }), 200
 
 
-    # -----------------------------------------------------
-    # COLOCA NA FILA
-    # -----------------------------------------------------
-
     executor.submit(
         process_job,
         data.copy()
     )
 
 
-    # IMPORTANTE:
-    # não espera o vídeo ser processado.
-
     return jsonify({
         "success": True,
         "queued": True,
-        "job_id": job_id,
-        "message": (
-            "Vídeo adicionado "
-            "à fila."
-        )
+        "job_id": job_id
     }), 202
 
 
 # =========================================================
-# EXTRACT SINCRONO
-#
-# Mantemos para teste manual.
+# TESTE SINCRONO
 # =========================================================
 
 @app.post("/extract")
@@ -1017,6 +1491,7 @@ def extract():
             or {}
         )
 
+
         url = data.get(
             "url"
         )
@@ -1026,9 +1501,7 @@ def extract():
 
             return jsonify({
                 "success": False,
-                "error": (
-                    "URL não informada."
-                )
+                "error": "URL não informada."
             }), 400
 
 
@@ -1037,16 +1510,13 @@ def extract():
         )
 
 
-        status_code = (
+        return jsonify(
+            result
+        ), (
             200
             if result.get("success")
             else 422
         )
-
-
-        return jsonify(
-            result
-        ), status_code
 
 
     except Exception as error:
