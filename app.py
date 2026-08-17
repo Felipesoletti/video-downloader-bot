@@ -1,11 +1,27 @@
 import os
 import re
 import html
+import uuid
+import time
+import json
+import shutil
+import subprocess
+import threading
 import requests
 import yt_dlp
 
-from flask import Flask, request, jsonify
+from flask import (
+    Flask,
+    request,
+    jsonify,
+    send_file,
+    abort
+)
 
+
+# =========================================================
+# APP
+# =========================================================
 
 app = Flask(__name__)
 
@@ -19,24 +35,115 @@ API_SECRET = os.environ.get(
     ""
 )
 
+TEMP_DIR = os.environ.get(
+    "TEMP_DIR",
+    "/tmp/shopee_video"
+)
+
+FILE_TTL_SECONDS = int(
+    os.environ.get(
+        "FILE_TTL_SECONDS",
+        "1800"
+    )
+)
+
+os.makedirs(
+    TEMP_DIR,
+    exist_ok=True
+)
+
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Mozilla/5.0 "
+        "(Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
 
     "Accept-Language": (
-        "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
+        "pt-BR,pt;q=0.9,"
+        "en-US;q=0.8,en;q=0.7"
     ),
 
     "Accept": (
-        "text/html,application/xhtml+xml,"
+        "text/html,"
+        "application/xhtml+xml,"
         "application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
+        "image/avif,image/webp,"
+        "*/*;q=0.8"
     ),
 }
+
+
+# =========================================================
+# ARQUIVOS TEMPORÁRIOS
+# =========================================================
+
+media_registry = {}
+media_lock = threading.Lock()
+
+
+def cleanup_temp_files():
+
+    agora = time.time()
+
+    expirados = []
+
+
+    with media_lock:
+
+        for token, info in list(
+            media_registry.items()
+        ):
+
+            created_at = info.get(
+                "created_at",
+                0
+            )
+
+            if (
+                agora - created_at
+                >
+                FILE_TTL_SECONDS
+            ):
+
+                expirados.append(
+                    token
+                )
+
+
+        for token in expirados:
+
+            info = media_registry.pop(
+                token,
+                None
+            )
+
+            if not info:
+                continue
+
+            path = info.get(
+                "path"
+            )
+
+            try:
+
+                if (
+                    path
+                    and
+                    os.path.exists(
+                        path
+                    )
+                ):
+
+                    os.remove(
+                        path
+                    )
+
+            except Exception:
+                pass
 
 
 # =========================================================
@@ -46,10 +153,16 @@ HEADERS = {
 @app.get("/")
 def home():
 
+    cleanup_temp_files()
+
     return jsonify({
         "status": "ok",
         "service": "video-downloader-bot",
-        "version": "5.0-diagnostic"
+        "version": "6.0-hls",
+        "ffmpeg": (
+            shutil.which("ffmpeg")
+            is not None
+        )
     })
 
 
@@ -83,12 +196,14 @@ def valid_api_secret():
 
 
 # =========================================================
-# IDENTIFICA SHOPEE
+# SHOPEE
 # =========================================================
 
 def is_shopee(url):
 
-    link = str(url).lower()
+    link = str(
+        url
+    ).lower()
 
     return (
         "shopee." in link
@@ -124,131 +239,391 @@ def clean_media_url(value):
     if not value:
         return None
 
+
     value = html.unescape(
-        value
+        str(value)
     )
 
-    value = value.replace(
-        "\\u002F",
-        "/"
-    )
 
-    value = value.replace(
-        "\\/",
-        "/"
-    )
+    substitutions = {
+        "\\u002F": "/",
+        "\\u002f": "/",
+        "\\/": "/",
+        "\\u0026": "&",
+        "\\u003D": "=",
+        "\\u003d": "=",
+        "\\u003F": "?",
+        "\\u003f": "?",
+        "\\u0025": "%",
+        "&amp;": "&"
+    }
 
-    value = value.replace(
-        "\\u0026",
-        "&"
-    )
 
-    value = value.replace(
-        "&amp;",
-        "&"
-    )
+    for old, new in substitutions.items():
+
+        value = value.replace(
+            old,
+            new
+        )
+
 
     if value.startswith("//"):
-        value = "https:" + value
+
+        value = (
+            "https:"
+            + value
+        )
+
 
     return value
 
 
 # =========================================================
-# ADICIONA CANDIDATO SEM DUPLICAR
+# ADICIONA CANDIDATO
 # =========================================================
 
 def add_candidate(
-    candidates,
+    collection,
     value,
-    source
+    source,
+    media_type
 ):
 
     value = clean_media_url(
         value
     )
 
+
     if not value:
         return
 
-    for item in candidates:
+
+    for item in collection:
 
         if (
-            item["url"] ==
+            item["url"]
+            ==
             value
         ):
+
             return
 
-    candidates.append({
+
+    collection.append({
         "url": value,
-        "source": source
+        "source": source,
+        "type": media_type
     })
 
 
 # =========================================================
-# ANALISA CANDIDATO
+# PROCURA URLs RECURSIVAMENTE EM JSON
 # =========================================================
 
-def inspect_candidate(
-    candidate,
-    referer
+def walk_json(
+    obj,
+    candidates,
+    path="root"
 ):
 
-    media_url = candidate[
-        "url"
+    if isinstance(
+        obj,
+        dict
+    ):
+
+        for key, value in obj.items():
+
+            child_path = (
+                path
+                + "."
+                + str(key)
+            )
+
+
+            if isinstance(
+                value,
+                str
+            ):
+
+                cleaned = clean_media_url(
+                    value
+                )
+
+
+                if cleaned:
+
+                    lower = cleaned.lower()
+
+
+                    if ".m3u8" in lower:
+
+                        add_candidate(
+                            candidates,
+                            cleaned,
+                            child_path,
+                            "hls"
+                        )
+
+
+                    elif ".mp4" in lower:
+
+                        add_candidate(
+                            candidates,
+                            cleaned,
+                            child_path,
+                            "mp4"
+                        )
+
+
+            else:
+
+                walk_json(
+                    value,
+                    candidates,
+                    child_path
+                )
+
+
+    elif isinstance(
+        obj,
+        list
+    ):
+
+        for index, item in enumerate(
+            obj
+        ):
+
+            walk_json(
+                item,
+                candidates,
+                (
+                    path
+                    + "["
+                    + str(index)
+                    + "]"
+                )
+            )
+
+
+# =========================================================
+# COLETA FONTES SHOPEE
+# =========================================================
+
+def collect_shopee_sources(url):
+
+    final_url = resolve_url(
+        url
+    )
+
+
+    response = requests.get(
+        final_url,
+        headers=HEADERS,
+        timeout=30
+    )
+
+
+    response.raise_for_status()
+
+
+    page = response.text
+
+
+    candidates = []
+
+
+    # =====================================================
+    # HLS .M3U8
+    # =====================================================
+
+    hls_patterns = [
+
+        r'https?://[^"\'\s<>]+\.m3u8[^"\'\s<>]*',
+
+        r'https?:\\?/\\?/[^"\'\s<>]+\.m3u8[^"\'\s<>]*',
+
+        r'"(?:hls|hlsUrl|hls_url|playlist|manifest|playUrl|play_url)"\s*:\s*"([^"]+)"',
     ]
 
-    result = {
-        "url":
-            media_url,
 
-        "source":
-            candidate.get(
-                "source"
-            ),
+    for pattern in hls_patterns:
 
-        "valid":
-            False,
+        matches = re.findall(
+            pattern,
+            page,
+            flags=re.IGNORECASE
+        )
 
-        "status":
-            None,
 
-        "content_type":
-            "",
+        for item in matches:
 
-        "content_length":
-            0,
+            cleaned = clean_media_url(
+                item
+            )
 
-        "final_url":
-            media_url,
 
-        "watermark_hint":
-            False
+            if (
+                cleaned
+                and ".m3u8"
+                in cleaned.lower()
+            ):
+
+                add_candidate(
+                    candidates,
+                    cleaned,
+                    "html_hls",
+                    "hls"
+                )
+
+
+    # =====================================================
+    # MP4
+    # =====================================================
+
+    mp4_patterns = [
+
+        r'https?://[^"\'\s<>]+\.mp4[^"\'\s<>]*',
+
+        r'https?:\\?/\\?/[^"\'\s<>]+\.mp4[^"\'\s<>]*',
+
+        r'"(?:videoUrl|video_url|playUrl|play_url|src|url)"\s*:\s*"([^"]+\.mp4[^"]*)"',
+    ]
+
+
+    for pattern in mp4_patterns:
+
+        matches = re.findall(
+            pattern,
+            page,
+            flags=re.IGNORECASE
+        )
+
+
+        for item in matches:
+
+            add_candidate(
+                candidates,
+                item,
+                "html_mp4",
+                "mp4"
+            )
+
+
+    # =====================================================
+    # TENTA EXTRAIR JSONS DO HTML
+    # =====================================================
+
+    script_matches = re.findall(
+        r'<script[^>]*>(.*?)</script>',
+        page,
+        flags=(
+            re.IGNORECASE
+            |
+            re.DOTALL
+        )
+    )
+
+
+    for script in script_matches:
+
+        stripped = script.strip()
+
+
+        if not stripped:
+            continue
+
+
+        # -------------------------------------------------
+        # JSON PURO
+        # -------------------------------------------------
+
+        if (
+            stripped.startswith("{")
+            or
+            stripped.startswith("[")
+        ):
+
+            try:
+
+                obj = json.loads(
+                    stripped
+                )
+
+
+                walk_json(
+                    obj,
+                    candidates
+                )
+
+            except Exception:
+                pass
+
+
+        # -------------------------------------------------
+        # MESMO QUE NÃO SEJA JSON VÁLIDO,
+        # PROCURA URLs DENTRO DO SCRIPT
+        # -------------------------------------------------
+
+        for match in re.findall(
+            r'https?:\\?/\\?/[^"\'\s]+',
+            stripped,
+            flags=re.IGNORECASE
+        ):
+
+            cleaned = clean_media_url(
+                match
+            )
+
+
+            if not cleaned:
+                continue
+
+
+            lower = cleaned.lower()
+
+
+            if ".m3u8" in lower:
+
+                add_candidate(
+                    candidates,
+                    cleaned,
+                    "script_raw",
+                    "hls"
+                )
+
+
+            elif ".mp4" in lower:
+
+                add_candidate(
+                    candidates,
+                    cleaned,
+                    "script_raw",
+                    "mp4"
+                )
+
+
+    return {
+        "resolved_url": final_url,
+        "page_length": len(page),
+        "candidates": candidates
     }
 
 
-    lower = (
-        media_url.lower()
-    )
+# =========================================================
+# TESTA MP4
+# =========================================================
 
+def inspect_mp4(
+    media_url,
+    referer
+):
 
-    watermark_terms = [
-        "watermark",
-        "watermarked",
-        "with_logo",
-        "with-logo",
-        "overlay",
-        "logo",
-        "wm="
-    ]
-
-
-    result[
-        "watermark_hint"
-    ] = any(
-        term in lower
-        for term in watermark_terms
-    )
+    result = {
+        "url": media_url,
+        "valid": False,
+        "size": 0,
+        "content_type": ""
+    }
 
 
     try:
@@ -264,20 +639,10 @@ def inspect_candidate(
 
             stream=True,
 
-            allow_redirects=True,
+            timeout=20,
 
-            timeout=20
+            allow_redirects=True
         )
-
-
-        result[
-            "status"
-        ] = response.status_code
-
-
-        result[
-            "final_url"
-        ] = response.url
 
 
         result[
@@ -305,7 +670,7 @@ def inspect_candidate(
             try:
 
                 result[
-                    "content_length"
+                    "size"
                 ] = int(
                     content_length
                 )
@@ -315,13 +680,20 @@ def inspect_candidate(
 
 
         if (
-            response.status_code < 400
-            and (
-                "video" in result[
+            response.status_code
+            <
+            400
+            and
+            (
+                "video"
+                in
+                result[
                     "content_type"
                 ]
                 or
-                ".mp4" in lower
+                ".mp4"
+                in
+                media_url.lower()
             )
         ):
 
@@ -346,332 +718,516 @@ def inspect_candidate(
 
 
 # =========================================================
-# COLETA TODOS OS CANDIDATOS SHOPEE
+# TESTA HLS
 # =========================================================
 
-def collect_shopee_candidates(
-    url
+def inspect_hls(
+    hls_url,
+    referer
 ):
 
-    final_url = resolve_url(
-        url
-    )
-
-
-    response = requests.get(
-        final_url,
-        headers=HEADERS,
-        timeout=30
-    )
-
-
-    response.raise_for_status()
-
-
-    page = response.text
-
-
-    candidates = []
-
-
-    # =====================================================
-    # MP4 DIRETO
-    # =====================================================
-
-    direct_patterns = [
-        r'https?://[^"\']+\.mp4[^"\']*',
-        r'https?:\\?/\\?/[^"\']+\.mp4[^"\']*',
-    ]
-
-
-    for pattern in direct_patterns:
-
-        matches = re.findall(
-            pattern,
-            page,
-            flags=re.IGNORECASE
-        )
-
-
-        for item in matches:
-
-            add_candidate(
-                candidates,
-                item,
-                "direct_mp4"
-            )
-
-
-    # =====================================================
-    # CAMPOS JSON
-    # =====================================================
-
-    json_patterns = {
-
-        "videoUrl":
-            r'"videoUrl"\s*:\s*"([^"]+)"',
-
-        "video_url":
-            r'"video_url"\s*:\s*"([^"]+)"',
-
-        "playUrl":
-            r'"playUrl"\s*:\s*"([^"]+)"',
-
-        "play_url":
-            r'"play_url"\s*:\s*"([^"]+)"',
-
-        "url":
-            r'"url"\s*:\s*"(https?:[^"]+\.mp4[^"]*)"',
-
-
-        "src":
-            r'"src"\s*:\s*"(https?:[^"]+\.mp4[^"]*)"',
+    result = {
+        "url": hls_url,
+        "valid": False,
+        "content_type": "",
+        "playlist_size": 0,
+        "master": False
     }
 
 
-    for source_name, pattern in (
-        json_patterns.items()
+    try:
+
+        response = requests.get(
+            hls_url,
+
+            headers={
+                **HEADERS,
+                "Referer":
+                    referer
+            },
+
+            timeout=20,
+
+            allow_redirects=True
+        )
+
+
+        result[
+            "content_type"
+        ] = (
+            response.headers
+            .get(
+                "content-type",
+                ""
+            )
+            .lower()
+        )
+
+
+        body = response.text
+
+
+        result[
+            "playlist_size"
+        ] = len(
+            body
+        )
+
+
+        if (
+            response.status_code
+            <
+            400
+            and
+            "#EXTM3U"
+            in
+            body
+        ):
+
+            result[
+                "valid"
+            ] = True
+
+
+            if (
+                "#EXT-X-STREAM-INF"
+                in
+                body
+            ):
+
+                result[
+                    "master"
+                ] = True
+
+
+    except Exception as error:
+
+        result[
+            "error"
+        ] = str(
+            error
+        )
+
+
+    return result
+
+
+# =========================================================
+# REMUX HLS PARA MP4
+#
+# NÃO REENCODA.
+# =========================================================
+
+def remux_hls_to_mp4(
+    hls_url,
+    referer
+):
+
+    if not shutil.which(
+        "ffmpeg"
     ):
 
-        matches = re.findall(
-            pattern,
-            page,
-            flags=re.IGNORECASE
-        )
-
-
-        for item in matches:
-
-            add_candidate(
-                candidates,
-                item,
-                source_name
+        return {
+            "success": False,
+            "error": (
+                "FFmpeg não instalado."
             )
+        }
 
 
-    # =====================================================
-    # VIDEO SRC
-    # =====================================================
+    token = uuid.uuid4().hex
 
-    matches = re.findall(
-        r'<video[^>]+src=["\']([^"\']+)["\']',
-        page,
-        flags=re.IGNORECASE
+
+    output_path = os.path.join(
+        TEMP_DIR,
+        token + ".mp4"
     )
 
 
-    for item in matches:
-
-        add_candidate(
-            candidates,
-            item,
-            "video_tag"
-        )
-
-
-    # =====================================================
-    # SOURCE SRC
-    # =====================================================
-
-    matches = re.findall(
-        r'<source[^>]+src=["\']([^"\']+)["\']',
-        page,
-        flags=re.IGNORECASE
+    headers_string = (
+        "User-Agent: "
+        + HEADERS["User-Agent"]
+        + "\r\n"
+        + "Referer: "
+        + referer
+        + "\r\n"
     )
 
 
-    for item in matches:
+    command = [
 
-        add_candidate(
-            candidates,
-            item,
-            "source_tag"
+        "ffmpeg",
+
+        "-y",
+
+        "-loglevel",
+        "error",
+
+        "-headers",
+        headers_string,
+
+        "-i",
+        hls_url,
+
+        "-map",
+        "0:v:0?",
+
+        "-map",
+        "0:a:0?",
+
+        "-c",
+        "copy",
+
+        "-movflags",
+        "+faststart",
+
+        output_path
+    ]
+
+
+    print(
+        "FFMPEG:",
+        " ".join(command)
+    )
+
+
+    try:
+
+        result = subprocess.run(
+            command,
+
+            stdout=subprocess.PIPE,
+
+            stderr=subprocess.PIPE,
+
+            timeout=180
         )
 
 
-    analyzed = []
+    except subprocess.TimeoutExpired:
 
-
-    for candidate in candidates:
-
-        analyzed.append(
-            inspect_candidate(
-                candidate,
-                final_url
+        return {
+            "success": False,
+            "error": (
+                "FFmpeg excedeu o tempo limite."
             )
-        )
+        }
+
+
+    if (
+        result.returncode != 0
+    ):
+
+        return {
+            "success": False,
+            "error": (
+                result.stderr
+                .decode(
+                    "utf-8",
+                    errors="ignore"
+                )
+            )
+        }
+
+
+    if not os.path.exists(
+        output_path
+    ):
+
+        return {
+            "success": False,
+            "error": (
+                "FFmpeg não gerou o arquivo."
+            )
+        }
+
+
+    size = os.path.getsize(
+        output_path
+    )
+
+
+    if size <= 0:
+
+        return {
+            "success": False,
+            "error": (
+                "Arquivo gerado está vazio."
+            )
+        }
+
+
+    with media_lock:
+
+        media_registry[
+            token
+        ] = {
+            "path":
+                output_path,
+
+            "created_at":
+                time.time()
+        }
 
 
     return {
-        "resolved_url":
-            final_url,
-
-        "page_length":
-            len(page),
-
-        "candidates":
-            analyzed
+        "success": True,
+        "token": token,
+        "size": size
     }
 
 
 # =========================================================
-# ESCOLHE MELHOR CANDIDATO
-# =========================================================
-
-def choose_best_candidate(
-    candidates
-):
-
-    valid = [
-        item
-        for item in candidates
-        if item.get(
-            "valid"
-        )
-    ]
-
-
-    if not valid:
-
-        return None
-
-
-    # -----------------------------------------------------
-    # PRIMEIRO TENTA CANDIDATOS SEM INDÍCIO DE WATERMARK
-    # -----------------------------------------------------
-
-    clean_candidates = [
-        item
-        for item in valid
-        if not item.get(
-            "watermark_hint"
-        )
-    ]
-
-
-    pool = (
-        clean_candidates
-        if clean_candidates
-        else valid
-    )
-
-
-    # -----------------------------------------------------
-    # MAIOR ARQUIVO PRIMEIRO
-    # -----------------------------------------------------
-
-    pool.sort(
-
-        key=lambda item:
-            item.get(
-                "content_length",
-                0
-            ),
-
-        reverse=True
-
-    )
-
-
-    return pool[0]
-
-
-# =========================================================
-# EXTRATOR SHOPEE
+# SHOPEE - MELHOR FONTE
 # =========================================================
 
 def extract_shopee_video(
     url
 ):
 
-    diagnostic = (
-        collect_shopee_candidates(
-            url
-        )
+    data = collect_shopee_sources(
+        url
     )
 
 
-    best = (
-        choose_best_candidate(
-            diagnostic[
-                "candidates"
+    final_url = data[
+        "resolved_url"
+    ]
+
+
+    candidates = data[
+        "candidates"
+    ]
+
+
+    print(
+        "TOTAL CANDIDATOS:",
+        len(candidates)
+    )
+
+
+    # =====================================================
+    # 1. PRIORIZA HLS
+    # =====================================================
+
+    valid_hls = []
+
+
+    for item in candidates:
+
+        if (
+            item.get("type")
+            !=
+            "hls"
+        ):
+
+            continue
+
+
+        inspected = inspect_hls(
+            item["url"],
+            final_url
+        )
+
+
+        if inspected.get(
+            "valid"
+        ):
+
+            inspected[
+                "source"
+            ] = item.get(
+                "source"
+            )
+
+
+            valid_hls.append(
+                inspected
+            )
+
+
+    # =====================================================
+    # SE ACHOU HLS, TENTA GERAR MP4
+    # =====================================================
+
+    for hls in valid_hls:
+
+        result = remux_hls_to_mp4(
+            hls["url"],
+            final_url
+        )
+
+
+        if result.get(
+            "success"
+        ):
+
+            token = result[
+                "token"
             ]
+
+
+            public_url = (
+                request.host_url
+                .rstrip("/")
+                +
+                "/media/"
+                +
+                token
+            )
+
+
+            return {
+                "success":
+                    True,
+
+                "platform":
+                    "Shopee",
+
+                "source_type":
+                    "hls",
+
+                "source":
+                    hls.get(
+                        "source"
+                    ),
+
+                "url":
+                    public_url,
+
+                "original_stream":
+                    hls["url"],
+
+                "file_size":
+                    result[
+                        "size"
+                    ],
+
+                "resolved_url":
+                    final_url,
+
+                "hls_found":
+                    len(
+                        valid_hls
+                    )
+            }
+
+
+    # =====================================================
+    # 2. FALLBACK MP4
+    #
+    # Só usa se não existir HLS utilizável.
+    # =====================================================
+
+    valid_mp4 = []
+
+
+    for item in candidates:
+
+        if (
+            item.get("type")
+            !=
+            "mp4"
+        ):
+
+            continue
+
+
+        inspected = inspect_mp4(
+            item["url"],
+            final_url
         )
-    )
 
 
-    if not best:
+        if inspected.get(
+            "valid"
+        ):
+
+            inspected[
+                "source"
+            ] = item.get(
+                "source"
+            )
+
+
+            valid_mp4.append(
+                inspected
+            )
+
+
+    if valid_mp4:
+
+        # maior arquivo primeiro
+
+        valid_mp4.sort(
+
+            key=lambda item:
+                item.get(
+                    "size",
+                    0
+                ),
+
+            reverse=True
+        )
+
+
+        best = valid_mp4[
+            0
+        ]
+
 
         return {
-
             "success":
-                False,
+                True,
 
             "platform":
                 "Shopee",
 
+            "source_type":
+                "mp4",
+
+            "url":
+                best[
+                    "url"
+                ],
+
+            "file_size":
+                best.get(
+                    "size"
+                ),
+
             "resolved_url":
-                diagnostic[
-                    "resolved_url"
-                ],
+                final_url,
 
-            "candidates":
-                diagnostic[
-                    "candidates"
-                ],
+            "hls_found":
+                0,
 
-            "error":
-                (
-                    "Não encontrei "
-                    "MP4 público válido."
+            "mp4_found":
+                len(
+                    valid_mp4
                 )
         }
 
 
     return {
-
         "success":
-            True,
+            False,
 
         "platform":
             "Shopee",
 
-        "url":
-            best[
-                "url"
-            ],
-
-        "selected_source":
-            best.get(
-                "source"
-            ),
-
-        "selected_size":
-            best.get(
-                "content_length"
-            ),
-
-        "watermark_hint":
-            best.get(
-                "watermark_hint"
-            ),
-
         "resolved_url":
-            diagnostic[
-                "resolved_url"
-            ],
+            final_url,
 
-        "candidates_found":
-            len(
-                diagnostic[
-                    "candidates"
-                ]
-            )
+        "error": (
+            "Não encontrei "
+            "stream HLS ou MP4 válido."
+        )
     }
 
 
 # =========================================================
-# YT-DLP
+# OUTRAS PLATAFORMAS
 # =========================================================
 
 def extract_with_ytdlp(
@@ -722,17 +1278,14 @@ def extract_with_ytdlp(
     if not video_url:
 
         return {
-
-            "success":
-                False,
-
-            "error":
-                "URL de vídeo não encontrada."
+            "success": False,
+            "error": (
+                "URL direta não encontrada."
+            )
         }
 
 
     return {
-
         "success":
             True,
 
@@ -789,10 +1342,8 @@ def extract_video(
         url
     ):
 
-        return (
-            extract_shopee_video(
-                url
-            )
+        return extract_shopee_video(
+            url
         )
 
 
@@ -802,22 +1353,23 @@ def extract_video(
 
 
 # =========================================================
-# /EXTRACT
+# EXTRACT
 # =========================================================
 
 @app.post("/extract")
 def extract():
 
+    cleanup_temp_files()
+
+
     if not valid_api_secret():
 
         return jsonify({
-
             "success":
                 False,
 
             "error":
                 "Não autorizado."
-
         }), 401
 
 
@@ -839,13 +1391,11 @@ def extract():
         if not url:
 
             return jsonify({
-
                 "success":
                     False,
 
                 "error":
                     "URL não informada."
-
             }), 400
 
 
@@ -867,22 +1417,23 @@ def extract():
 
     except Exception as error:
 
-        return jsonify({
+        print(
+            "ERRO:",
+            error
+        )
 
+
+        return jsonify({
             "success":
                 False,
 
             "error":
                 str(error)
-
         }), 500
 
 
 # =========================================================
-# /DIAGNOSTIC
-#
-# ESTE É O ENDPOINT QUE VAMOS USAR AGORA
-# PARA DESCOBRIR A VERSÃO LIMPA.
+# DIAGNÓSTICO
 # =========================================================
 
 @app.post("/diagnostic")
@@ -891,13 +1442,11 @@ def diagnostic():
     if not valid_api_secret():
 
         return jsonify({
-
             "success":
                 False,
 
             "error":
                 "Não autorizado."
-
         }), 401
 
 
@@ -919,40 +1468,69 @@ def diagnostic():
         if not url:
 
             return jsonify({
-
                 "success":
                     False,
 
                 "error":
                     "URL não informada."
-
             }), 400
 
 
-        if not is_shopee(
+        result = collect_shopee_sources(
             url
-        ):
-
-            return jsonify({
-
-                "success":
-                    False,
-
-                "error":
-                    "Diagnostic é somente Shopee."
-
-            }), 400
-
-
-        result = (
-            collect_shopee_candidates(
-                url
-            )
         )
 
 
-        return jsonify({
+        analyzed = []
 
+
+        for item in result[
+            "candidates"
+        ]:
+
+            if (
+                item["type"]
+                ==
+                "hls"
+            ):
+
+                detail = inspect_hls(
+                    item["url"],
+                    result[
+                        "resolved_url"
+                    ]
+                )
+
+            else:
+
+                detail = inspect_mp4(
+                    item["url"],
+                    result[
+                        "resolved_url"
+                    ]
+                )
+
+
+            detail[
+                "source"
+            ] = item.get(
+                "source"
+            )
+
+
+            detail[
+                "type"
+            ] = item.get(
+                "type"
+            )
+
+
+            analyzed.append(
+                detail
+            )
+
+
+        return jsonify({
             "success":
                 True,
 
@@ -961,30 +1539,70 @@ def diagnostic():
                     "resolved_url"
                 ],
 
-            "page_length":
-                result[
-                    "page_length"
-                ],
-
             "candidates":
-                result[
-                    "candidates"
-                ]
-
+                analyzed
         })
 
 
     except Exception as error:
 
         return jsonify({
-
             "success":
                 False,
 
             "error":
                 str(error)
-
         }), 500
+
+
+# =========================================================
+# ENTREGA MP4 TEMPORÁRIO
+# =========================================================
+
+@app.get("/media/<token>")
+def media(token):
+
+    cleanup_temp_files()
+
+
+    with media_lock:
+
+        info = media_registry.get(
+            token
+        )
+
+
+    if not info:
+
+        abort(
+            404
+        )
+
+
+    path = info.get(
+        "path"
+    )
+
+
+    if (
+        not path
+        or
+        not os.path.exists(
+            path
+        )
+    ):
+
+        abort(
+            404
+        )
+
+
+    return send_file(
+        path,
+        mimetype="video/mp4",
+        as_attachment=False,
+        download_name="video.mp4"
+    )
 
 
 # =========================================================
